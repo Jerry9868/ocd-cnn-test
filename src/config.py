@@ -8,8 +8,9 @@ DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
 
 @dataclass
 class Config:
-    # Spectrum shape
-    n_channels: int = 16          # M00..M33
+    # Spectrum shape: 16 Mueller elements (65-degree oblique incidence,
+    # M00..M33) + 2 normal-incidence reference spectra (TE, TM).
+    n_channels: int = 18
     n_wavelength: int = 101
     wavelength_min: float = 200.0  # nm
     wavelength_max: float = 1000.0  # nm
@@ -44,8 +45,9 @@ class Config:
     patience: int = 25  # early stopping on val loss
 
     # Reporting only -- what counts as an "acceptable" error, for the
-    # fraction_over_threshold test metric. Not currently met on every sample;
-    # see PROJECT_NOTES.md.
+    # fraction_over_threshold test metric. Not currently met on every sample
+    # (see train.py's module docstring for what was tried and why it was
+    # reverted in favor of stability).
     error_threshold_nm: float = 0.30
 
     # Output

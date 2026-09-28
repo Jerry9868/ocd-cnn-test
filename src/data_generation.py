@@ -1,21 +1,26 @@
-"""Synthetic Mueller-matrix spectrum generator.
+"""Synthetic Mueller-matrix (+ TE/TM) spectrum generator.
 
 Stands in for real OCD measurement/simulation data until that is available.
-Not a physical solver (no RCWA) -- it fabricates 16-channel spectra that share
+Not a physical solver (no RCWA) -- it fabricates n_channels-channel spectra
+(Config.n_channels defaults to 18: 16 Mueller elements + TE + TM) that share
 an underlying set of CD-dependent basis functions, so that:
 
 Real-instrument context (for whoever wires up the actual data loader):
-  * the 16-channel Mueller matrix is measured at 65-degree oblique incidence
-    onto the wafer.
-  * there will also be two additional normal-incidence (0-degree) spectra --
-    TE and TM -- alongside the 16 Mueller channels. Not yet represented here;
-    when the real format lands this likely becomes an 18-channel input
-    (n_channels=18) rather than 16, which MultiChannelCNN1D already supports
-    via its n_channels argument -- no architecture change needed, just cfg
-    and the data loader.
+  * the 16-channel Mueller matrix (M00..M33, channels 0-15) is measured at
+    65-degree oblique incidence onto the wafer.
+  * channels 16-17 stand in for two additional normal-incidence (0-degree)
+    spectra -- TE and TM -- that will also be provided. They're generated
+    here the same way as any other channel (just two more rows of the
+    n_channels x n_bases mixing matrix), which is almost certainly not how
+    they actually relate to the Mueller channels physically (different
+    incidence angle, different measurement principle) -- treat this purely
+    as a placeholder to exercise the 18-channel pipeline end-to-end, not as
+    a claim about the real TE/TM relationship. Swap in a real loader once
+    the format is confirmed.
 
-  * each of the 16 "elements" is a distinct linear mixture of the same bases
-    (i.e. genuine cross-channel correlation, not independent per-channel noise)
+  * each of the n_channels "elements" is a distinct linear mixture of the
+    same bases (i.e. genuine cross-channel correlation, not independent
+    per-channel noise)
   * the mixture weights are fixed per element, while the bases themselves
     shift with CD (resonance-like center/amplitude dependence on CD), so CD
     is recoverable from the spectrum shape

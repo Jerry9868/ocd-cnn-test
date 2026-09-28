@@ -4,9 +4,9 @@ Run with:
     streamlit run app.py
 
 Two tabs:
-  * 光譜檢視與預測 -- simulate a Mueller-matrix spectrum (for testing, before
-    the real measurement format is finalized) or upload a spectrum file,
-    choose which of the 16 Mueller elements to display, see the model's
+  * 光譜檢視與預測 -- simulate a spectrum (16 Mueller elements + TE + TM, for
+    testing, before the real measurement format is finalized) or upload a
+    spectrum file, choose which channels to display, see the model's
     CD-sensitive wavelength regions highlighted on each curve, and get a CD
     prediction from the trained Multi-channel 1D CNN.
   * 模型訓練 / 超參數 -- adjust training hyperparameters and retrain, without
@@ -16,16 +16,24 @@ outputs/multichannel_cnn.pt is the checkpoint both tabs read/write.
 """
 import dataclasses
 import os
+import re
 import sys
+import time
 
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 
+# matplotlib's default font has no CJK glyphs, so any Chinese text on a
+# figure (titles, suptitle) renders as mojibake boxes -- use a Traditional
+# Chinese-capable font that ships with Windows.
+plt.rcParams["font.sans-serif"] = ["Microsoft JhengHei", "Microsoft YaHei", "SimHei", "sans-serif"]
+plt.rcParams["axes.unicode_minus"] = False
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from config import Config  # noqa: E402
-from spectrum_io import MUELLER_LABELS, generate_single_spectrum, load_spectrum_file, resample_to_grid  # noqa: E402
+from spectrum_io import CHANNEL_LABELS, generate_single_spectrum, load_spectrum_file, resample_to_grid  # noqa: E402
 from inference import load_checkpoint, predict_cd, sensitivity_map  # noqa: E402
 from train import run_training  # noqa: E402
 
@@ -72,6 +80,8 @@ with tab_viewer:
         st.session_state.wavelength = None
         st.session_state.true_cd = None
         st.session_state.source = None
+    if "tem_cd" not in st.session_state:
+        st.session_state.tem_cd = None
 
     with st.sidebar:
         st.header("資料來源")
@@ -85,9 +95,14 @@ with tab_viewer:
                 st.session_state.wavelength = wl
                 st.session_state.true_cd = cd_value
                 st.session_state.source = "simulated"
+                st.session_state.tem_cd = None
         else:
-            st.caption("目前接受格式：.csv（header: wavelength, M00...M33）或 .npy（shape (16, L)）。實際量測格式待確認後再對接。")
-            uploaded = st.file_uploader("上傳光譜檔", type=["csv", "npy"])
+            st.caption(
+                "目前接受格式：.csv / .dat（header: wavelength, M00...M33, TE, TM）、"
+                ".npy（shape (18, L)）、.zip（內含 .dat，見 src/spectrum_io.py 說明）。"
+                "實際量測格式待確認後再對接，.dat/.zip 的解析規則目前是暫定猜測。"
+            )
+            uploaded = st.file_uploader("上傳光譜檔", type=["csv", "dat", "npy", "zip"])
             if uploaded is not None:
                 try:
                     X, wl = load_spectrum_file(uploaded, model_cfg)
@@ -95,33 +110,58 @@ with tab_viewer:
                     st.session_state.wavelength = wl
                     st.session_state.true_cd = None
                     st.session_state.source = "uploaded"
+                    st.session_state.tem_cd = None
                 except Exception as e:
                     st.error(f"讀取失敗：{e}")
+
+        st.header("TEM CD 參考值（選填）")
+        st.caption("上傳 TEM 實際量測到的 CD 數值（檔案內第一個數字會被當作 CD，單位 nm），或直接手動輸入，用來跟模型預測值比較。")
+        tem_file = st.file_uploader("上傳 TEM CD 參考檔", type=["csv", "txt", "dat"], key="tem_file")
+        if tem_file is not None:
+            try:
+                content = tem_file.read()
+                content = content.decode("utf-8") if isinstance(content, bytes) else content
+                nums = re.findall(r"[-+]?\d*\.?\d+", content)
+                if nums:
+                    st.session_state.tem_cd = float(nums[0])
+                else:
+                    st.error("在檔案裡找不到數字。")
+            except Exception as e:
+                st.error(f"讀取 TEM 參考值失敗：{e}")
+        manual_tem_cd = st.number_input(
+            "或手動輸入 TEM CD (nm)", min_value=0.0, max_value=1000.0,
+            value=float(st.session_state.tem_cd) if st.session_state.tem_cd is not None else 0.0,
+            step=0.1,
+        )
+        if manual_tem_cd > 0:
+            st.session_state.tem_cd = manual_tem_cd
 
         if model_bundle is None:
             st.warning("尚未找到訓練好的模型（outputs/multichannel_cnn.pt）。請先到「模型訓練」頁籤訓練一次。")
 
-        st.header("顯示的 Mueller Elements")
+        st.header("顯示的量測通道")
+        st.caption("M00–M33：65° 斜入射 Mueller matrix；TE / TM：正向入射參考光譜")
 
         def _apply_select_all():
-            for lbl in MUELLER_LABELS:
+            for lbl in CHANNEL_LABELS:
                 st.session_state[f"ch_{lbl}"] = st.session_state["select_all"]
 
         st.checkbox("全選 / 全不選", value=True, key="select_all", on_change=_apply_select_all)
         selected = []
-        for row in range(4):
-            cols = st.columns(4)
-            for col in range(4):
-                idx = row * 4 + col
-                label = MUELLER_LABELS[idx]
-                with cols[col]:
+        n_cols = 4
+        for row_start in range(0, len(CHANNEL_LABELS), n_cols):
+            row_labels = CHANNEL_LABELS[row_start:row_start + n_cols]
+            cols = st.columns(n_cols)
+            for col, label in zip(cols, row_labels):
+                idx = CHANNEL_LABELS.index(label)
+                with col:
                     if st.checkbox(label, value=True, key=f"ch_{label}"):
                         selected.append(idx)
 
     if st.session_state.spectrum is None:
         st.info("請從左側產生模擬光譜，或上傳光譜檔案。")
     elif not selected:
-        st.info("請至少勾選一個 Mueller element 來顯示光譜。")
+        st.info("請至少勾選一個通道來顯示光譜。")
     else:
         X = st.session_state.spectrum
         wl = st.session_state.wavelength
@@ -130,7 +170,7 @@ with tab_viewer:
         if model_bundle is not None:
             model, cfg, norm = model_bundle
             X_grid = resample_to_grid(X, wl, np.linspace(cfg.wavelength_min, cfg.wavelength_max, cfg.n_wavelength))
-            sens = sensitivity_map(model, norm, X_grid)  # (16, L_grid), on the model's own wavelength grid
+            sens = sensitivity_map(model, norm, X_grid)  # (n_channels, L_grid), on the model's own wavelength grid
 
         col_plot, col_pred = st.columns([3, 1])
 
@@ -147,14 +187,14 @@ with tab_viewer:
                     mask = sens[ch] >= np.percentile(sens[ch], SENSITIVITY_PERCENTILE)
                     for lo, hi in highlighted_spans(mask, sens_wl):
                         ax.axvspan(lo, hi, color="orange", alpha=0.25, linewidth=0)
-                ax.set_title(MUELLER_LABELS[ch], fontsize=9)
+                ax.set_title(CHANNEL_LABELS[ch], fontsize=9)
                 ax.tick_params(labelsize=7)
             for i in range(n, nrows * ncols):
                 axes[i // ncols][i % ncols].axis("off")
             if sens is not None:
-                fig.suptitle("選定的 Mueller Elements（橘色區域 = 模型判斷的 CD 特徵敏感波段）")
+                fig.suptitle("選定的量測通道（橘色區域 = 模型判斷的 CD 特徵敏感波段）")
             else:
-                fig.suptitle("選定的 Mueller Elements（尚無模型，無法標示特徵區域）")
+                fig.suptitle("選定的量測通道（尚無模型，無法標示特徵區域）")
             fig.tight_layout()
             st.pyplot(fig)
 
@@ -162,12 +202,16 @@ with tab_viewer:
             st.subheader("預測結果")
             if st.session_state.true_cd is not None:
                 st.metric("模擬 Ground-truth CD (nm)", f"{st.session_state.true_cd:.2f}")
+            if st.session_state.tem_cd is not None:
+                st.metric("TEM 參考 CD (nm)", f"{st.session_state.tem_cd:.2f}")
 
             if model_bundle is not None:
                 pred_cd = predict_cd(model, norm, X_grid)
                 st.metric("模型預測 CD (nm)", f"{pred_cd:.2f}")
                 if st.session_state.true_cd is not None:
-                    st.metric("誤差 (nm)", f"{pred_cd - st.session_state.true_cd:+.2f}")
+                    st.metric("誤差 vs 模擬 (nm)", f"{pred_cd - st.session_state.true_cd:+.2f}")
+                if st.session_state.tem_cd is not None:
+                    st.metric("誤差 vs TEM (nm)", f"{pred_cd - st.session_state.tem_cd:+.2f}")
             else:
                 st.write("尚無可用模型。")
 
@@ -209,15 +253,24 @@ with tab_train:
             patience=int(patience),
         )
         progress_bar = st.progress(0.0, text="準備開始訓練...")
+        train_start = time.time()
+
+        def _fmt_secs(s: float) -> str:
+            m, s = divmod(max(0, int(s)), 60)
+            return f"{m:02d}:{s:02d}"
 
         def _on_epoch(epoch, max_epochs, log):
+            elapsed = time.time() - train_start
+            eta = (elapsed / epoch) * (max_epochs - epoch)
             progress_bar.progress(
                 min(epoch / max_epochs, 1.0),
-                text=f"epoch {epoch}/{max_epochs}  val_loss={log['val_loss']:.4f}  val_mean_err={log['val_mean_nm']:.3f}nm",
+                text=(
+                    f"epoch {epoch}/{max_epochs}  val_loss={log['val_loss']:.4f}  val_mean_err={log['val_mean_nm']:.3f}nm  "
+                    f"已耗時 {_fmt_secs(elapsed)}，預估剩餘 ≤{_fmt_secs(eta)}（可能因 early stopping 提早結束）"
+                ),
             )
 
-        with st.spinner("訓練中..."):
-            result = run_training(cfg, progress_cb=_on_epoch)
+        result = run_training(cfg, progress_cb=_on_epoch)
 
         progress_bar.progress(1.0, text="訓練完成")
         st.success("訓練完成，模型已更新。")
