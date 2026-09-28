@@ -1,4 +1,10 @@
 __pycache__/
 *.pyc
 streamlit_test.log
-.streamlit/
+.streamlit/secrets.toml
+
+# Real measurement data is never committed here -- put it under one of
+# these local-only folders (or add its actual path once decided).
+data/
+real_data/
+raw_data/
