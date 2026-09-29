@@ -75,9 +75,23 @@ def highlighted_spans(mask: np.ndarray, wavelength: np.ndarray):
     return spans
 
 
-def plot_channels_overlay(samples: list, wl: np.ndarray, selected: list, title: str):
+def _shade_sensitivity(ax, ch: int, sens, model_cfg):
+    """Shade the top SENSITIVITY_PERCENTILE% most CD-sensitive wavelength
+    regions for channel `ch` (see inference.sensitivity_map). No-op if
+    sens is None."""
+    if sens is None:
+        return
+    sens_wl = np.linspace(model_cfg.wavelength_min, model_cfg.wavelength_max, model_cfg.n_wavelength)
+    mask = sens[ch] >= np.percentile(sens[ch], SENSITIVITY_PERCENTILE)
+    for lo, hi in highlighted_spans(mask, sens_wl):
+        ax.axvspan(lo, hi, color="orange", alpha=0.25, linewidth=0)
+
+
+def plot_channels_overlay(samples: list, wl: np.ndarray, selected: list, title: str, sens=None, model_cfg=None):
     """One line per sample (color-coded, by 編號), per selected channel --
-    an at-a-glance view of an entire uploaded batch."""
+    an at-a-glance view of an entire uploaded batch. `sens`, if given, is a
+    single (n_channels, L) sensitivity map (e.g. averaged across the batch)
+    shaded behind every sample's lines."""
     n = len(selected)
     ncols = min(4, n)
     nrows = int(np.ceil(n / ncols))
@@ -86,6 +100,7 @@ def plot_channels_overlay(samples: list, wl: np.ndarray, selected: list, title: 
     colors = [cmap(i / max(len(samples) - 1, 1)) for i in range(len(samples))]
     for i, ch in enumerate(selected):
         ax = axes[i // ncols][i % ncols]
+        _shade_sensitivity(ax, ch, sens, model_cfg)
         for s, color in zip(samples, colors):
             ax.plot(wl, s["X_grid"][ch], linewidth=0.8, color=color, label=f"#{s['編號']}")
         ax.set_title(CHANNEL_LABELS[ch], fontsize=9)
@@ -110,11 +125,7 @@ def plot_channels(X: np.ndarray, wl: np.ndarray, selected: list, sens, model_cfg
     for i, ch in enumerate(selected):
         ax = axes[i // ncols][i % ncols]
         ax.plot(wl, X[ch], linewidth=1, color="tab:blue")
-        if sens is not None:
-            sens_wl = np.linspace(model_cfg.wavelength_min, model_cfg.wavelength_max, model_cfg.n_wavelength)
-            mask = sens[ch] >= np.percentile(sens[ch], SENSITIVITY_PERCENTILE)
-            for lo, hi in highlighted_spans(mask, sens_wl):
-                ax.axvspan(lo, hi, color="orange", alpha=0.25, linewidth=0)
+        _shade_sensitivity(ax, ch, sens, model_cfg)
         ax.set_title(CHANNEL_LABELS[ch], fontsize=9)
         ax.tick_params(labelsize=7)
     for i in range(n, nrows * ncols):
@@ -384,9 +395,14 @@ with tab_batch:
         ok_samples = [s for s in samples if s.get("X_grid") is not None]
         if ok_samples:
             st.subheader("所有樣本光譜總覽")
+            overlay_sens = None
+            if batch_model_bundle is not None:
+                sens_maps = [sensitivity_map(b_model, b_norm, s["X_grid"]) for s in ok_samples]
+                overlay_sens = np.mean(np.stack(sens_maps), axis=0)  # (n_channels, L), averaged across the batch
+            overlay_title = f"批次內全部 {len(ok_samples)} 筆樣本（依編號上色{'；橘色區域 = 批次平均後的 CD 特徵敏感波段' if overlay_sens is not None else ''}）"
             overlay_fig = plot_channels_overlay(
-                ok_samples, st.session_state.batch_target_wl, selected,
-                f"批次內全部 {len(ok_samples)} 筆樣本（依編號上色）",
+                ok_samples, st.session_state.batch_target_wl, selected, overlay_title,
+                sens=overlay_sens, model_cfg=st.session_state.batch_cfg,
             )
             st.pyplot(overlay_fig)
             plt.close(overlay_fig)
