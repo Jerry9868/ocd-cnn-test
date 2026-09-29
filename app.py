@@ -3,16 +3,21 @@
 Run with:
     streamlit run app.py
 
-Two tabs:
+Three tabs:
   * 光譜檢視與預測 -- simulate a spectrum (16 Mueller elements + TE + TM, for
     testing, before the real measurement format is finalized) or upload a
     spectrum file, choose which channels to display, see the model's
     CD-sensitive wavelength regions highlighted on each curve, and get a CD
     prediction from the trained Multi-channel 1D CNN.
+  * 批次驗證 -- upload many spectrum files at once plus an optional TEM CD
+    reference table (matched by filename), get a numbered results table with
+    per-sample predictions/errors, download it as CSV, and inspect any one
+    sample's channels either raw or as a deviation from the batch mean or
+    from another chosen sample.
   * 模型訓練 / 超參數 -- adjust training hyperparameters and retrain, without
     touching config.py or the command line.
 
-outputs/multichannel_cnn.pt is the checkpoint both tabs read/write.
+outputs/multichannel_cnn.pt is the checkpoint all tabs read/write.
 """
 import dataclasses
 import os
@@ -21,6 +26,7 @@ import sys
 import time
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
@@ -68,7 +74,31 @@ def highlighted_spans(mask: np.ndarray, wavelength: np.ndarray):
     return spans
 
 
-tab_viewer, tab_train = st.tabs(["光譜檢視與預測", "模型訓練 / 超參數"])
+def plot_channels(X: np.ndarray, wl: np.ndarray, selected: list, sens, model_cfg, title: str):
+    """Grid of line plots for the selected channel indices, with optional
+    sensitivity shading (see sensitivity_map). Returns the Figure."""
+    n = len(selected)
+    ncols = min(4, n)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3 * ncols, 2.5 * nrows), squeeze=False)
+    for i, ch in enumerate(selected):
+        ax = axes[i // ncols][i % ncols]
+        ax.plot(wl, X[ch], linewidth=1, color="tab:blue")
+        if sens is not None:
+            sens_wl = np.linspace(model_cfg.wavelength_min, model_cfg.wavelength_max, model_cfg.n_wavelength)
+            mask = sens[ch] >= np.percentile(sens[ch], SENSITIVITY_PERCENTILE)
+            for lo, hi in highlighted_spans(mask, sens_wl):
+                ax.axvspan(lo, hi, color="orange", alpha=0.25, linewidth=0)
+        ax.set_title(CHANNEL_LABELS[ch], fontsize=9)
+        ax.tick_params(labelsize=7)
+    for i in range(n, nrows * ncols):
+        axes[i // ncols][i % ncols].axis("off")
+    fig.suptitle(title)
+    fig.tight_layout()
+    return fig
+
+
+tab_viewer, tab_batch, tab_train = st.tabs(["光譜檢視與預測", "批次驗證", "模型訓練 / 超參數"])
 
 # ---------------------------------------------------------------- viewer ---
 with tab_viewer:
@@ -175,28 +205,11 @@ with tab_viewer:
         col_plot, col_pred = st.columns([3, 1])
 
         with col_plot:
-            n = len(selected)
-            ncols = min(4, n)
-            nrows = int(np.ceil(n / ncols))
-            fig, axes = plt.subplots(nrows, ncols, figsize=(3 * ncols, 2.5 * nrows), squeeze=False)
-            for i, ch in enumerate(selected):
-                ax = axes[i // ncols][i % ncols]
-                ax.plot(wl, X[ch], linewidth=1, color="tab:blue")
-                if sens is not None:
-                    sens_wl = np.linspace(model_cfg.wavelength_min, model_cfg.wavelength_max, model_cfg.n_wavelength)
-                    mask = sens[ch] >= np.percentile(sens[ch], SENSITIVITY_PERCENTILE)
-                    for lo, hi in highlighted_spans(mask, sens_wl):
-                        ax.axvspan(lo, hi, color="orange", alpha=0.25, linewidth=0)
-                ax.set_title(CHANNEL_LABELS[ch], fontsize=9)
-                ax.tick_params(labelsize=7)
-            for i in range(n, nrows * ncols):
-                axes[i // ncols][i % ncols].axis("off")
-            if sens is not None:
-                fig.suptitle("選定的量測通道（橘色區域 = 模型判斷的 CD 特徵敏感波段）")
-            else:
-                fig.suptitle("選定的量測通道（尚無模型，無法標示特徵區域）")
-            fig.tight_layout()
+            title = "選定的量測通道（橘色區域 = 模型判斷的 CD 特徵敏感波段）" if sens is not None \
+                else "選定的量測通道（尚無模型，無法標示特徵區域）"
+            fig = plot_channels(X, wl, selected, sens, model_cfg, title)
             st.pyplot(fig)
+            plt.close(fig)
 
         with col_pred:
             st.subheader("預測結果")
@@ -214,6 +227,125 @@ with tab_viewer:
                     st.metric("誤差 vs TEM (nm)", f"{pred_cd - st.session_state.tem_cd:+.2f}")
             else:
                 st.write("尚無可用模型。")
+
+# ----------------------------------------------------------------- batch ---
+with tab_batch:
+    st.caption(
+        "批次上傳多筆光譜檔（每個檔案代表一筆樣本，格式同「光譜檢視與預測」頁籤：.csv/.dat/.npy/.zip），"
+        "可選擇搭配一份 TEM CD 參考對照表（.csv，需有 filename 與 CD_TEM_nm 兩欄，依檔名比對），"
+        "一次計算模型在多筆樣本上的預測與誤差。"
+    )
+
+    batch_model_bundle = get_model()
+    if batch_model_bundle is not None:
+        b_model, b_cfg, b_norm = batch_model_bundle
+
+    batch_files = st.file_uploader(
+        "上傳多筆光譜檔", type=["csv", "dat", "npy", "zip"], accept_multiple_files=True, key="batch_spectra",
+    )
+    ref_file = st.file_uploader("上傳 TEM CD 參考對照表（選填）", type=["csv"], key="batch_ref")
+
+    ref_map = {}
+    if ref_file is not None:
+        try:
+            ref_df = pd.read_csv(ref_file)
+            cols_lower = {c.lower().strip(): c for c in ref_df.columns}
+            fname_col = cols_lower.get("filename") or cols_lower.get("sample_id")
+            cd_col = cols_lower.get("cd_tem_nm") or cols_lower.get("cd_tem") or cols_lower.get("tem_cd_nm")
+            if not fname_col or not cd_col:
+                st.error("參考表需要包含 filename（或 sample_id）與 CD_TEM_nm 欄位。")
+            else:
+                ref_map = dict(zip(ref_df[fname_col].astype(str), ref_df[cd_col].astype(float)))
+        except Exception as e:
+            st.error(f"讀取參考表失敗：{e}")
+
+    if batch_files and st.button("執行批次預測"):
+        if batch_model_bundle is None:
+            st.error("尚無可用模型，請先到「模型訓練」頁籤訓練一次。")
+        else:
+            target_wl = np.linspace(b_cfg.wavelength_min, b_cfg.wavelength_max, b_cfg.n_wavelength)
+
+            samples = []  # list of dicts: idx, filename, X_grid, wl, tem_cd, pred_cd, error, err_msg
+            for i, f in enumerate(batch_files, start=1):
+                entry = {"編號": i, "filename": f.name}
+                try:
+                    X, wl = load_spectrum_file(f, b_cfg)
+                    X_grid = resample_to_grid(X, wl, target_wl)
+                    pred = predict_cd(b_model, b_norm, X_grid)
+                    tem_cd = ref_map.get(f.name)
+                    entry.update({
+                        "X_grid": X_grid,
+                        "TEM_CD_nm": tem_cd,
+                        "Predicted_CD_nm": pred,
+                        "Error_nm": (pred - tem_cd) if tem_cd is not None else None,
+                    })
+                except Exception as e:
+                    entry.update({"X_grid": None, "TEM_CD_nm": None, "Predicted_CD_nm": None,
+                                  "Error_nm": None, "讀取錯誤": str(e)})
+                samples.append(entry)
+
+            st.session_state.batch_results = samples
+            st.session_state.batch_target_wl = target_wl
+            st.session_state.batch_cfg = b_cfg
+
+    if st.session_state.get("batch_results"):
+        samples = st.session_state.batch_results
+        display_cols = ["編號", "filename", "TEM_CD_nm", "Predicted_CD_nm", "Error_nm"]
+        table_df = pd.DataFrame([{k: s.get(k) for k in display_cols + ["讀取錯誤"]} for s in samples])
+        st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+        matched = table_df.dropna(subset=["Error_nm"])
+        if len(matched):
+            errs = matched["Error_nm"].abs().to_numpy()
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("已比對 TEM 參考值的樣本數", f"{len(matched)} / {len(samples)}")
+            c2.metric("MAE (nm)", f"{errs.mean():.3f}")
+            c3.metric("RMSE (nm)", f"{np.sqrt((errs ** 2).mean()):.3f}")
+            c4.metric("Max |Error| (nm)", f"{errs.max():.3f}")
+        else:
+            st.info("沒有樣本比對到 TEM 參考值（檔名需與參考表一致），僅顯示模型預測結果。")
+
+        csv_bytes = table_df.drop(columns=["讀取錯誤"]).to_csv(index=False).encode("utf-8")
+        st.download_button("下載結果 CSV", data=csv_bytes, file_name="batch_predictions.csv", mime="text/csv")
+
+        st.divider()
+        ok_samples = [s for s in samples if s.get("X_grid") is not None]
+        if ok_samples:
+            options = {f"{s['編號']} - {s['filename']}": s for s in ok_samples}
+            picked_label = st.selectbox("選擇要檢視的樣本", list(options.keys()))
+            picked = options[picked_label]
+
+            baseline_mode = st.radio(
+                "顯示方式", ["原始光譜", "與批次平均光譜的差值", "與指定樣本光譜的差值"], horizontal=True,
+            )
+
+            baseline_spectrum = None
+            title_suffix = ""
+            if baseline_mode == "與批次平均光譜的差值":
+                baseline_spectrum = np.mean(np.stack([s["X_grid"] for s in ok_samples]), axis=0)  # (n_channels, L)
+                title_suffix = "（與批次平均光譜的差值）"
+            elif baseline_mode == "與指定樣本光譜的差值":
+                ref_options = {k: v for k, v in options.items() if v is not picked}
+                if ref_options:
+                    ref_label = st.selectbox("選擇作為基準的樣本", list(ref_options.keys()))
+                    baseline_spectrum = ref_options[ref_label]["X_grid"]
+                    title_suffix = f"（與 {ref_label} 的差值）"
+                else:
+                    st.info("批次裡只有一筆樣本，無法選擇其他樣本作為基準。")
+
+            X_show = (picked["X_grid"] - baseline_spectrum) if baseline_spectrum is not None else picked["X_grid"]
+
+            b_sens = sensitivity_map(b_model, b_norm, picked["X_grid"]) if batch_model_bundle is not None else None
+            title = f"#{picked['編號']} {picked['filename']}{title_suffix}"
+            fig = plot_channels(X_show, st.session_state.batch_target_wl, selected, b_sens, st.session_state.batch_cfg, title)
+            st.pyplot(fig)
+            plt.close(fig)
+
+            pc1, pc2, pc3 = st.columns(3)
+            pc1.metric("模型預測 CD (nm)", f"{picked['Predicted_CD_nm']:.2f}")
+            if picked["TEM_CD_nm"] is not None:
+                pc2.metric("TEM 參考 CD (nm)", f"{picked['TEM_CD_nm']:.2f}")
+                pc3.metric("誤差 (nm)", f"{picked['Error_nm']:+.2f}")
 
 # ----------------------------------------------------------------- train ---
 with tab_train:
