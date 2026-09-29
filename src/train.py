@@ -12,7 +12,10 @@ tab calls it directly with a Config built from the UI, so hyperparameters
 don't have to be edited in this file or passed on the CLI.
 
 Trains with plain MSE and selects the checkpoint with the lowest validation
-MSE -- this is stable and reproducible. An earlier attempt to select by
+MSE -- this is stable and reproducible. Default setup (2026-09-30): flatten
+head (keeps wavelength position), no dropout, cosine LR over a fixed number
+of epochs -- see config.py. The legacy setup (avg pooling, dropout 0.2,
+ReduceLROnPlateau + early stopping) is still selectable via Config. An earlier attempt to select by
 worst-case (p99) validation error, with a loss penalty for residuals beyond
 cfg.error_threshold_nm, made training *less* stable and produced worse
 results on this architecture/data. The per-epoch and final nm-scale error
@@ -46,6 +49,13 @@ def parse_args(cfg: Config) -> Config:
         p.add_argument(f"--{field}", type=type(default), default=default)
     args = p.parse_args()
     return Config(**vars(args))
+
+
+def model_arch(cfg: Config) -> dict:
+    """Constructor kwargs for MultiChannelCNN1D -- saved into the checkpoint
+    so inference rebuilds exactly the architecture that was trained."""
+    return dict(n_channels=cfg.n_channels, hidden=cfg.hidden_dim, dropout=cfg.dropout,
+                pooling=cfg.pooling, n_wavelength=cfg.n_wavelength)
 
 
 def run_epoch(model, loader, criterion, optimizer, device, train: bool):
@@ -132,10 +142,16 @@ def run_training(cfg: Config, progress_cb=None) -> dict:
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size)
     test_loader = DataLoader(test_ds, batch_size=cfg.batch_size)
 
-    model = MultiChannelCNN1D(n_channels=cfg.n_channels, hidden=cfg.hidden_dim).to(device)
+    arch = model_arch(cfg)
+    model = MultiChannelCNN1D(**arch).to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=8)
+    if cfg.lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=cfg.lr * 0.01)
+    elif cfg.lr_schedule == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=8)
+    else:
+        raise ValueError(f"lr_schedule must be 'cosine' or 'plateau', got {cfg.lr_schedule!r}")
 
     best_val = float("inf")
     best_state = None
@@ -146,7 +162,10 @@ def run_training(cfg: Config, progress_cb=None) -> dict:
         train_loss = run_epoch(model, train_loader, criterion, optimizer, device, train=True)
         val_loss = run_epoch(model, val_loader, criterion, optimizer, device, train=False)
         val_stats = nm_error_stats(model, val_loader, norm, device)
-        scheduler.step(val_loss)
+        if cfg.lr_schedule == "plateau":
+            scheduler.step(val_loss)
+        else:
+            scheduler.step()
         epoch_log = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss,
                      **{f"val_{k}_nm": v for k, v in val_stats.items()}}
         history.append(epoch_log)
@@ -164,7 +183,7 @@ def run_training(cfg: Config, progress_cb=None) -> dict:
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
-            if epochs_no_improve >= cfg.patience:
+            if cfg.lr_schedule == "plateau" and epochs_no_improve >= cfg.patience:
                 print(f"Early stopping at epoch {epoch} (no val_loss improvement for {cfg.patience} epochs).")
                 break
 
@@ -187,6 +206,7 @@ def run_training(cfg: Config, progress_cb=None) -> dict:
         {
             "model_state": model.state_dict(),
             "config": cfg.__dict__,
+            "arch": arch,
             "norm_mean": norm.mean,
             "norm_std": norm.std,
             "norm_y_mean": norm.y_mean,

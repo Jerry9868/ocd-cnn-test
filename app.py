@@ -256,67 +256,113 @@ with tab_viewer:
 
 # ----------------------------------------------------------------- batch ---
 with tab_batch:
-    st.caption(
-        "批次上傳多筆光譜檔（每個檔案代表一筆樣本，格式同「光譜檢視與預測」頁籤：.csv/.dat/.npy/.zip），"
-        "可選擇搭配一份 TEM CD 參考對照表（.csv，需有 filename 與 CD_TEM_nm 兩欄，依檔名比對），"
-        "一次計算模型在多筆樣本上的預測與誤差。"
-    )
-
     batch_model_bundle = get_model()
     if batch_model_bundle is not None:
         b_model, b_cfg, b_norm = batch_model_bundle
 
-    batch_files = st.file_uploader(
-        "上傳多筆光譜檔", type=["csv", "dat", "npy", "zip"], accept_multiple_files=True, key="batch_spectra",
+    batch_source = st.radio(
+        "批次資料來源", ["上傳光譜檔案", "生成模擬批次資料（測試用）"], horizontal=True, key="batch_source",
     )
-    ref_file = st.file_uploader("上傳 TEM CD 參考對照表（選填）", type=["csv"], key="batch_ref")
 
-    ref_map = {}
-    if ref_file is not None:
-        try:
-            ref_df = pd.read_csv(ref_file)
-            cols_lower = {c.lower().strip(): c for c in ref_df.columns}
-            fname_col = cols_lower.get("filename") or cols_lower.get("sample_id")
-            cd_col = cols_lower.get("cd_tem_nm") or cols_lower.get("cd_tem") or cols_lower.get("tem_cd_nm")
-            if not fname_col or not cd_col:
-                st.error("參考表需要包含 filename（或 sample_id）與 CD_TEM_nm 欄位。")
+    if batch_source == "上傳光譜檔案":
+        st.caption(
+            "批次上傳多筆光譜檔（每個檔案代表一筆樣本，格式同「光譜檢視與預測」頁籤：.csv/.dat/.npy/.zip），"
+            "可選擇搭配一份 TEM CD 參考對照表（.csv，需有 filename 與 CD_TEM_nm 兩欄，依檔名比對），"
+            "一次計算模型在多筆樣本上的預測與誤差。"
+        )
+
+        batch_files = st.file_uploader(
+            "上傳多筆光譜檔", type=["csv", "dat", "npy", "zip"], accept_multiple_files=True, key="batch_spectra",
+        )
+        ref_file = st.file_uploader("上傳 TEM CD 參考對照表（選填）", type=["csv"], key="batch_ref")
+
+        ref_map = {}
+        if ref_file is not None:
+            try:
+                ref_df = pd.read_csv(ref_file)
+                cols_lower = {c.lower().strip(): c for c in ref_df.columns}
+                fname_col = cols_lower.get("filename") or cols_lower.get("sample_id")
+                cd_col = cols_lower.get("cd_tem_nm") or cols_lower.get("cd_tem") or cols_lower.get("tem_cd_nm")
+                if not fname_col or not cd_col:
+                    st.error("參考表需要包含 filename（或 sample_id）與 CD_TEM_nm 欄位。")
+                else:
+                    ref_map = dict(zip(ref_df[fname_col].astype(str), ref_df[cd_col].astype(float)))
+            except Exception as e:
+                st.error(f"讀取參考表失敗：{e}")
+
+        if batch_files and st.button("執行批次預測"):
+            if batch_model_bundle is None:
+                st.error("尚無可用模型，請先到「模型訓練」頁籤訓練一次。")
             else:
-                ref_map = dict(zip(ref_df[fname_col].astype(str), ref_df[cd_col].astype(float)))
-        except Exception as e:
-            st.error(f"讀取參考表失敗：{e}")
+                target_wl = np.linspace(b_cfg.wavelength_min, b_cfg.wavelength_max, b_cfg.n_wavelength)
 
-    if batch_files and st.button("執行批次預測"):
-        if batch_model_bundle is None:
-            st.error("尚無可用模型，請先到「模型訓練」頁籤訓練一次。")
-        else:
-            target_wl = np.linspace(b_cfg.wavelength_min, b_cfg.wavelength_max, b_cfg.n_wavelength)
+                samples = []  # list of dicts: idx, filename, X_grid, wl, ref_cd, pred_cd, error, err_msg
+                for i, f in enumerate(batch_files, start=1):
+                    entry = {"編號": i, "filename": f.name}
+                    try:
+                        X, wl = load_spectrum_file(f, b_cfg)
+                        X_grid = resample_to_grid(X, wl, target_wl)
+                        pred = predict_cd(b_model, b_norm, X_grid)
+                        ref_cd = ref_map.get(f.name)
+                        entry.update({
+                            "X_grid": X_grid,
+                            "Reference_CD_nm": ref_cd,
+                            "Predicted_CD_nm": pred,
+                            "Error_nm": (pred - ref_cd) if ref_cd is not None else None,
+                        })
+                    except Exception as e:
+                        entry.update({"X_grid": None, "Reference_CD_nm": None, "Predicted_CD_nm": None,
+                                      "Error_nm": None, "讀取錯誤": str(e)})
+                    samples.append(entry)
 
-            samples = []  # list of dicts: idx, filename, X_grid, wl, tem_cd, pred_cd, error, err_msg
-            for i, f in enumerate(batch_files, start=1):
-                entry = {"編號": i, "filename": f.name}
-                try:
-                    X, wl = load_spectrum_file(f, b_cfg)
+                st.session_state.batch_results = samples
+                st.session_state.batch_target_wl = target_wl
+                st.session_state.batch_cfg = b_cfg
+                st.session_state.batch_ref_label = "TEM"
+
+    else:
+        st.caption(
+            "不需要真實資料，用目前的模型設定直接生成多筆模擬光譜，CD 值在您指定的範圍內平均分布，"
+            "方便確認批次驗證頁籤（總覽圖、逐筆檢視、差值顯示）功能是否正常。"
+        )
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            n_sim = st.number_input("樣本數量", min_value=2, max_value=50, value=6, step=1)
+        with sc2:
+            sim_cd_min = st.number_input("CD 下限 (nm)", value=float(default_cfg.cd_min))
+        with sc3:
+            sim_cd_max = st.number_input("CD 上限 (nm)", value=float(default_cfg.cd_max))
+
+        if st.button("生成模擬批次資料"):
+            if batch_model_bundle is None:
+                st.error("尚無可用模型，請先到「模型訓練」頁籤訓練一次。")
+            else:
+                target_wl = np.linspace(b_cfg.wavelength_min, b_cfg.wavelength_max, b_cfg.n_wavelength)
+                cd_values = np.linspace(sim_cd_min, sim_cd_max, int(n_sim))
+
+                samples = []
+                for i, cd in enumerate(cd_values, start=1):
+                    X, wl = generate_single_spectrum(float(cd), b_cfg, seed=10_000 + i)
                     X_grid = resample_to_grid(X, wl, target_wl)
                     pred = predict_cd(b_model, b_norm, X_grid)
-                    tem_cd = ref_map.get(f.name)
-                    entry.update({
+                    samples.append({
+                        "編號": i,
+                        "filename": f"simulated_CD{cd:.1f}nm",
                         "X_grid": X_grid,
-                        "TEM_CD_nm": tem_cd,
+                        "Reference_CD_nm": float(cd),
                         "Predicted_CD_nm": pred,
-                        "Error_nm": (pred - tem_cd) if tem_cd is not None else None,
+                        "Error_nm": pred - float(cd),
                     })
-                except Exception as e:
-                    entry.update({"X_grid": None, "TEM_CD_nm": None, "Predicted_CD_nm": None,
-                                  "Error_nm": None, "讀取錯誤": str(e)})
-                samples.append(entry)
 
-            st.session_state.batch_results = samples
-            st.session_state.batch_target_wl = target_wl
-            st.session_state.batch_cfg = b_cfg
+                st.session_state.batch_results = samples
+                st.session_state.batch_target_wl = target_wl
+                st.session_state.batch_cfg = b_cfg
+                st.session_state.batch_ref_label = "模擬 Ground-truth"
 
     if st.session_state.get("batch_results"):
+        ref_label = st.session_state.get("batch_ref_label", "參考")
         samples = st.session_state.batch_results
-        display_cols = ["編號", "filename", "TEM_CD_nm", "Predicted_CD_nm", "Error_nm"]
+        display_cols = ["編號", "filename", "Reference_CD_nm", "Predicted_CD_nm", "Error_nm"]
         table_df = pd.DataFrame([{k: s.get(k) for k in display_cols + ["讀取錯誤"]} for s in samples])
         st.dataframe(table_df, width="stretch", hide_index=True)
 
@@ -324,12 +370,12 @@ with tab_batch:
         if len(matched):
             errs = matched["Error_nm"].abs().to_numpy()
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("已比對 TEM 參考值的樣本數", f"{len(matched)} / {len(samples)}")
+            c1.metric(f"已有{ref_label}值的樣本數", f"{len(matched)} / {len(samples)}")
             c2.metric("MAE (nm)", f"{errs.mean():.3f}")
             c3.metric("RMSE (nm)", f"{np.sqrt((errs ** 2).mean()):.3f}")
             c4.metric("Max |Error| (nm)", f"{errs.max():.3f}")
         else:
-            st.info("沒有樣本比對到 TEM 參考值（檔名需與參考表一致），僅顯示模型預測結果。")
+            st.info(f"沒有樣本比對到{ref_label}值（檔名需與參考表一致），僅顯示模型預測結果。")
 
         csv_bytes = table_df.drop(columns=["讀取錯誤"]).to_csv(index=False).encode("utf-8")
         st.download_button("下載結果 CSV", data=csv_bytes, file_name="batch_predictions.csv", mime="text/csv")
@@ -379,8 +425,8 @@ with tab_batch:
 
             pc1, pc2, pc3 = st.columns(3)
             pc1.metric("模型預測 CD (nm)", f"{picked['Predicted_CD_nm']:.2f}")
-            if picked["TEM_CD_nm"] is not None:
-                pc2.metric("TEM 參考 CD (nm)", f"{picked['TEM_CD_nm']:.2f}")
+            if picked["Reference_CD_nm"] is not None:
+                pc2.metric(f"{ref_label} CD (nm)", f"{picked['Reference_CD_nm']:.2f}")
                 pc3.metric("誤差 (nm)", f"{picked['Error_nm']:+.2f}")
 
 # ----------------------------------------------------------------- train ---
@@ -402,8 +448,24 @@ with tab_train:
             weight_decay = st.number_input("weight_decay", 0.0, 1.0, default_cfg.weight_decay, step=1e-4, format="%.5f")
         with c3:
             lr = st.number_input("learning rate", 1e-6, 1.0, default_cfg.lr, step=1e-4, format="%.5f")
-            epochs = st.number_input("epochs（上限）", 1, 2000, default_cfg.epochs, step=10)
-            patience = st.number_input("patience（early stopping）", 1, 500, default_cfg.patience, step=5)
+            epochs = st.number_input("epochs", 1, 2000, default_cfg.epochs, step=10)
+            lr_schedule = st.selectbox(
+                "學習率排程", ["cosine", "plateau"],
+                index=["cosine", "plateau"].index(default_cfg.lr_schedule),
+                help="cosine：學習率在固定 epochs 內平滑遞減，不做 early stopping（建議）。"
+                     "plateau：舊版 ReduceLROnPlateau + early stopping。",
+            )
+            patience = st.number_input("patience（early stopping，僅 plateau 模式）", 1, 500, default_cfg.patience, step=5)
+
+        with st.expander("模型架構（進階）"):
+            a1, a2 = st.columns(2)
+            with a1:
+                pooling = st.selectbox(
+                    "pooling", ["flatten", "avg"], index=["flatten", "avg"].index(default_cfg.pooling),
+                    help="flatten：保留波長位置資訊（建議，CD 主要反映在特徵峰的位置）。avg：舊版全域平均池化。",
+                )
+            with a2:
+                dropout = st.number_input("dropout", 0.0, 0.9, default_cfg.dropout, step=0.05, format="%.2f")
 
         submitted = st.form_submit_button("開始訓練")
 
@@ -418,7 +480,10 @@ with tab_train:
             weight_decay=float(weight_decay),
             lr=float(lr),
             epochs=int(epochs),
+            lr_schedule=str(lr_schedule),
             patience=int(patience),
+            pooling=str(pooling),
+            dropout=float(dropout),
         )
         progress_bar = st.progress(0.0, text="準備開始訓練...")
         train_start = time.time()
@@ -434,7 +499,8 @@ with tab_train:
                 min(epoch / max_epochs, 1.0),
                 text=(
                     f"epoch {epoch}/{max_epochs}  val_loss={log['val_loss']:.4f}  val_mean_err={log['val_mean_nm']:.3f}nm  "
-                    f"已耗時 {_fmt_secs(elapsed)}，預估剩餘 ≤{_fmt_secs(eta)}（可能因 early stopping 提早結束）"
+                    f"已耗時 {_fmt_secs(elapsed)}，預估剩餘 ≤{_fmt_secs(eta)}"
+                    + ("（可能因 early stopping 提早結束）" if cfg.lr_schedule == "plateau" else "")
                 ),
             )
 

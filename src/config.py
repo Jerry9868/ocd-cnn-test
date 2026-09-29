@@ -36,13 +36,24 @@ class Config:
 
     # Model
     hidden_dim: int = 96
+    # "flatten" keeps wavelength-position info in the head (CD is encoded in
+    # where spectral features sit); "avg" is the legacy global-average-pool
+    # variant. See models/multichannel_cnn.py.
+    pooling: str = "flatten"
+    dropout: float = 0.0
 
     # Training
     batch_size: int = 64
-    epochs: int = 300
+    epochs: int = 150
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    patience: int = 25  # early stopping on val loss
+    # "cosine": LR decays smoothly from lr to lr*0.01 over exactly `epochs`
+    # epochs, no early stopping (val loss is too noisy epoch-to-epoch for
+    # plateau detection to be reliable -- the legacy run stopped at epoch 65
+    # of 300). The lowest-val-loss epoch is still the one kept.
+    # "plateau": legacy ReduceLROnPlateau + early stopping after `patience`.
+    lr_schedule: str = "cosine"
+    patience: int = 25  # early stopping on val loss (plateau mode only)
 
     # Reporting only -- what counts as an "acceptable" error, for the
     # fraction_over_threshold test metric. Not currently met on every sample

@@ -1,3 +1,5 @@
+import dataclasses
+
 import numpy as np
 import torch
 
@@ -10,8 +12,16 @@ def load_checkpoint(path: str):
     # (train.py) and includes numpy normalization arrays alongside the model
     # state dict, which PyTorch's default safe unpickler rejects.
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    cfg = Config(**ckpt["config"])
-    model = MultiChannelCNN1D(n_channels=cfg.n_channels, hidden=cfg.hidden_dim)
+    known = {f.name for f in dataclasses.fields(Config)}
+    cfg = Config(**{k: v for k, v in ckpt["config"].items() if k in known})
+    arch = ckpt.get("arch")
+    if arch is None:
+        # Checkpoint from before the architecture was configurable: global
+        # average pooling + dropout 0.2 (dropout is inactive in eval anyway).
+        arch = dict(n_channels=cfg.n_channels, hidden=cfg.hidden_dim, dropout=0.2,
+                    pooling="avg", n_wavelength=cfg.n_wavelength)
+        cfg.pooling, cfg.dropout = "avg", 0.2
+    model = MultiChannelCNN1D(**arch)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     norm = {
