@@ -8,3 +8,7 @@ streamlit_test.log
 data/
 real_data/
 raw_data/
+
+# Trained checkpoints / metrics. Once trained on real data these encode
+# information about that data, so keep them local-only too.
+outputs/

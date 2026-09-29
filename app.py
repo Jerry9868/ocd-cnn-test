@@ -11,9 +11,10 @@ Three tabs:
     prediction from the trained Multi-channel 1D CNN.
   * 批次驗證 -- upload many spectrum files at once plus an optional TEM CD
     reference table (matched by filename), get a numbered results table with
-    per-sample predictions/errors, download it as CSV, and inspect any one
-    sample's channels either raw or as a deviation from the batch mean or
-    from another chosen sample.
+    per-sample predictions/errors, download it as CSV, see every sample's
+    spectrum overlaid per channel, and inspect any one sample's channels
+    either raw or as a deviation from the batch mean or from another chosen
+    sample.
   * 模型訓練 / 超參數 -- adjust training hyperparameters and retrain, without
     touching config.py or the command line.
 
@@ -72,6 +73,31 @@ def highlighted_spans(mask: np.ndarray, wavelength: np.ndarray):
     if start is not None:
         spans.append((wavelength[start], wavelength[-1]))
     return spans
+
+
+def plot_channels_overlay(samples: list, wl: np.ndarray, selected: list, title: str):
+    """One line per sample (color-coded, by 編號), per selected channel --
+    an at-a-glance view of an entire uploaded batch."""
+    n = len(selected)
+    ncols = min(4, n)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3 * ncols, 2.5 * nrows), squeeze=False)
+    cmap = plt.get_cmap("viridis")
+    colors = [cmap(i / max(len(samples) - 1, 1)) for i in range(len(samples))]
+    for i, ch in enumerate(selected):
+        ax = axes[i // ncols][i % ncols]
+        for s, color in zip(samples, colors):
+            ax.plot(wl, s["X_grid"][ch], linewidth=0.8, color=color, label=f"#{s['編號']}")
+        ax.set_title(CHANNEL_LABELS[ch], fontsize=9)
+        ax.tick_params(labelsize=7)
+    for i in range(n, nrows * ncols):
+        axes[i // ncols][i % ncols].axis("off")
+    if len(samples) <= 12:
+        handles, labels = axes[0][0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper right", fontsize=7, ncol=min(len(samples), 4))
+    fig.suptitle(title)
+    fig.tight_layout()
+    return fig
 
 
 def plot_channels(X: np.ndarray, wl: np.ndarray, selected: list, sens, model_cfg, title: str):
@@ -292,7 +318,7 @@ with tab_batch:
         samples = st.session_state.batch_results
         display_cols = ["編號", "filename", "TEM_CD_nm", "Predicted_CD_nm", "Error_nm"]
         table_df = pd.DataFrame([{k: s.get(k) for k in display_cols + ["讀取錯誤"]} for s in samples])
-        st.dataframe(table_df, use_container_width=True, hide_index=True)
+        st.dataframe(table_df, width="stretch", hide_index=True)
 
         matched = table_df.dropna(subset=["Error_nm"])
         if len(matched):
@@ -311,6 +337,16 @@ with tab_batch:
         st.divider()
         ok_samples = [s for s in samples if s.get("X_grid") is not None]
         if ok_samples:
+            st.subheader("所有樣本光譜總覽")
+            overlay_fig = plot_channels_overlay(
+                ok_samples, st.session_state.batch_target_wl, selected,
+                f"批次內全部 {len(ok_samples)} 筆樣本（依編號上色）",
+            )
+            st.pyplot(overlay_fig)
+            plt.close(overlay_fig)
+
+            st.divider()
+            st.subheader("單一樣本細看")
             options = {f"{s['編號']} - {s['filename']}": s for s in ok_samples}
             picked_label = st.selectbox("選擇要檢視的樣本", list(options.keys()))
             picked = options[picked_label]

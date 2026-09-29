@@ -1,2 +1,7 @@
 [browser]
 gatherUsageStats = false
+
+[server]
+# Only listen on this computer -- without this Streamlit binds every network
+# interface and anyone on the same LAN/Wi-Fi can open the app.
+address = "localhost"
