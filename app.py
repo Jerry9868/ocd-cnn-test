@@ -395,13 +395,37 @@ with tab_batch:
         ok_samples = [s for s in samples if s.get("X_grid") is not None]
         if ok_samples:
             st.subheader("所有樣本光譜總覽")
+            overlay_baseline_mode = st.radio(
+                "顯示方式", ["原始光譜", "與批次平均光譜的差值", "與指定樣本光譜的差值"],
+                horizontal=True, key="overlay_baseline_mode",
+            )
+
+            overlay_baseline = None
+            overlay_suffix = ""
+            if overlay_baseline_mode == "與批次平均光譜的差值":
+                overlay_baseline = np.mean(np.stack([s["X_grid"] for s in ok_samples]), axis=0)
+                overlay_suffix = "；每條線 = 該樣本與批次平均光譜的差值"
+            elif overlay_baseline_mode == "與指定樣本光譜的差值":
+                overlay_options = {f"{s['編號']} - {s['filename']}": s for s in ok_samples}
+                overlay_ref_label = st.selectbox("選擇作為基準的樣本", list(overlay_options.keys()), key="overlay_ref")
+                overlay_baseline = overlay_options[overlay_ref_label]["X_grid"]
+                overlay_suffix = f"；每條線 = 該樣本與 {overlay_ref_label} 的差值"
+
+            display_samples = ok_samples if overlay_baseline is None else [
+                {**s, "X_grid": s["X_grid"] - overlay_baseline} for s in ok_samples
+            ]
+
             overlay_sens = None
             if batch_model_bundle is not None:
                 sens_maps = [sensitivity_map(b_model, b_norm, s["X_grid"]) for s in ok_samples]
                 overlay_sens = np.mean(np.stack(sens_maps), axis=0)  # (n_channels, L), averaged across the batch
-            overlay_title = f"批次內全部 {len(ok_samples)} 筆樣本（依編號上色{'；橘色區域 = 批次平均後的 CD 特徵敏感波段' if overlay_sens is not None else ''}）"
+            overlay_title = (
+                f"批次內全部 {len(ok_samples)} 筆樣本（依編號上色"
+                f"{'；橘色區域 = 批次平均後的 CD 特徵敏感波段' if overlay_sens is not None else ''}"
+                f"{overlay_suffix}）"
+            )
             overlay_fig = plot_channels_overlay(
-                ok_samples, st.session_state.batch_target_wl, selected, overlay_title,
+                display_samples, st.session_state.batch_target_wl, selected, overlay_title,
                 sens=overlay_sens, model_cfg=st.session_state.batch_cfg,
             )
             st.pyplot(overlay_fig)
