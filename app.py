@@ -8,7 +8,10 @@ Three tabs:
     testing, before the real measurement format is finalized) or upload a
     spectrum file, choose which channels to display, see the model's
     CD-sensitive wavelength regions highlighted on each curve, and get a CD
-    prediction from the trained Multi-channel 1D CNN.
+    prediction from the trained network (MLP by default, or the
+    Multi-channel 1D CNN) -- refined against the learned forward model when
+    the checkpoint has one (src/refinement.py), with an error bar and a
+    warning for spectra that don't look like the training data.
   * 批次驗證 -- upload many spectrum files at once plus an optional TEM CD
     reference table (matched by filename), get a numbered results table with
     per-sample predictions/errors, download it as CSV, see every sample's
@@ -18,7 +21,8 @@ Three tabs:
   * 模型訓練 / 超參數 -- adjust training hyperparameters and retrain, without
     touching config.py or the command line.
 
-outputs/multichannel_cnn.pt is the checkpoint all tabs read/write.
+outputs/multichannel_cnn.pt is the checkpoint all tabs read/write (the
+file name predates the MLP option; it holds whichever model was trained).
 """
 import dataclasses
 import os
@@ -41,7 +45,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from config import Config  # noqa: E402
 from spectrum_io import CHANNEL_LABELS, generate_single_spectrum, load_spectrum_file, resample_to_grid  # noqa: E402
-from inference import load_checkpoint, predict_cd, sensitivity_map  # noqa: E402
+from inference import load_checkpoint, load_refinement, predict_cd, predict_cd_refined, sensitivity_map  # noqa: E402
 from train import run_training  # noqa: E402
 
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "outputs", "multichannel_cnn.pt")
@@ -58,6 +62,25 @@ def get_model():
     if not os.path.exists(CHECKPOINT_PATH):
         return None
     return load_checkpoint(CHECKPOINT_PATH)
+
+
+@st.cache_resource
+def get_refinement():
+    if not os.path.exists(CHECKPOINT_PATH):
+        return None
+    return load_refinement(CHECKPOINT_PATH)
+
+
+def predict_sample(model, norm, refinement, X_grid: np.ndarray, use_refinement: bool, fit_offset: bool) -> dict:
+    """CD for one spectrum on the model's grid. "cd" is the value to report:
+    the refined one when refinement is in use, else the network's. The
+    refinement-only entries are None otherwise."""
+    if refinement is not None and use_refinement:
+        r = predict_cd_refined(model, refinement, X_grid, fit_offset=fit_offset)
+        return {"cd": r["cd"], "cd_network": r["cd_network"], "cd_sd": r["cd_sd"],
+                "flagged": r["flagged"], "offset": r.get("offset"), "refined": True}
+    cd = predict_cd(model, norm, X_grid)
+    return {"cd": cd, "cd_network": cd, "cd_sd": None, "flagged": None, "offset": None, "refined": False}
 
 
 def highlighted_spans(mask: np.ndarray, wavelength: np.ndarray):
@@ -206,6 +229,24 @@ with tab_viewer:
         if model_bundle is None:
             st.warning("尚未找到訓練好的模型（outputs/multichannel_cnn.pt）。請先到「模型訓練」頁籤訓練一次。")
 
+        refinement = get_refinement()
+        st.header("預測方式")
+        if refinement is None:
+            use_refinement, fit_offset = False, False
+            st.caption("目前的模型沒有擬合修正（舊模型，或訓練時關閉）。重新訓練即可啟用。")
+        else:
+            if not refinement.recommended:
+                st.caption("訓練時的驗證結果顯示擬合修正沒有比網路直接預測好（通常是訓練資料太少），預設不啟用。")
+            use_refinement = st.checkbox(
+                "擬合修正", value=refinement.recommended, key="use_refinement",
+                help="以網路預測為起點，對學出來的正向模型（CD → 光譜）做最小平方擬合；"
+                     "同時給出誤差棒，並標示與訓練資料不符的光譜。",
+            )
+            fit_offset = st.checkbox(
+                "同時擬合波長校正偏移", value=False, key="fit_offset", disabled=not use_refinement,
+                help="把波長軸的整體偏移當成額外未知數一起解，避免校正誤差被當成 CD 變化。",
+            )
+
         st.header("顯示的量測通道")
         st.caption("M00–M33：65° 斜入射 Mueller matrix；TE / TM：正向入射參考光譜")
 
@@ -256,8 +297,18 @@ with tab_viewer:
                 st.metric("TEM 參考 CD (nm)", f"{st.session_state.tem_cd:.2f}")
 
             if model_bundle is not None:
-                pred_cd = predict_cd(model, norm, X_grid)
-                st.metric("模型預測 CD (nm)", f"{pred_cd:.2f}")
+                pred = predict_sample(model, norm, refinement, X_grid, use_refinement, fit_offset)
+                pred_cd = pred["cd"]
+                if pred["refined"]:
+                    st.metric("預測 CD (nm)，擬合修正後", f"{pred_cd:.2f} ± {2 * pred['cd_sd']:.2f}",
+                              help="± 為 2 個標準差（約 95% 信賴區間）")
+                    st.metric("網路直接預測 CD (nm)", f"{pred['cd_network']:.2f}")
+                    if pred["offset"] is not None:
+                        st.metric("擬合出的波長偏移 (nm)", f"{pred['offset']:+.2f}")
+                    if pred["flagged"]:
+                        st.warning("這條光譜與訓練資料不符（擬合殘差偏高），預測值可能不可靠。")
+                else:
+                    st.metric("模型預測 CD (nm)", f"{pred_cd:.2f}")
                 if st.session_state.true_cd is not None:
                     st.metric("誤差 vs 模擬 (nm)", f"{pred_cd - st.session_state.true_cd:+.2f}")
                 if st.session_state.tem_cd is not None:
@@ -270,6 +321,22 @@ with tab_batch:
     batch_model_bundle = get_model()
     if batch_model_bundle is not None:
         b_model, b_cfg, b_norm = batch_model_bundle
+    b_refinement = get_refinement()
+    # Same choice as the viewer tab's sidebar.
+    b_use_refinement = bool(st.session_state.get("use_refinement", False)) and b_refinement is not None
+    b_fit_offset = bool(st.session_state.get("fit_offset", False))
+
+    def _batch_prediction(X_grid, ref_cd):
+        pred = predict_sample(b_model, b_norm, b_refinement, X_grid, b_use_refinement, b_fit_offset)
+        return {
+            "X_grid": X_grid,
+            "Reference_CD_nm": ref_cd,
+            "Predicted_CD_nm": pred["cd"],
+            "CD_2sigma_nm": 2 * pred["cd_sd"] if pred["cd_sd"] is not None else None,
+            "Network_CD_nm": pred["cd_network"],
+            "殘差警示": pred["flagged"],
+            "Error_nm": (pred["cd"] - ref_cd) if ref_cd is not None else None,
+        }
 
     batch_source = st.radio(
         "批次資料來源", ["上傳光譜檔案", "生成模擬批次資料（測試用）"], horizontal=True, key="batch_source",
@@ -313,14 +380,7 @@ with tab_batch:
                     try:
                         X, wl = load_spectrum_file(f, b_cfg)
                         X_grid = resample_to_grid(X, wl, target_wl)
-                        pred = predict_cd(b_model, b_norm, X_grid)
-                        ref_cd = ref_map.get(f.name)
-                        entry.update({
-                            "X_grid": X_grid,
-                            "Reference_CD_nm": ref_cd,
-                            "Predicted_CD_nm": pred,
-                            "Error_nm": (pred - ref_cd) if ref_cd is not None else None,
-                        })
+                        entry.update(_batch_prediction(X_grid, ref_map.get(f.name)))
                     except Exception as e:
                         entry.update({"X_grid": None, "Reference_CD_nm": None, "Predicted_CD_nm": None,
                                       "Error_nm": None, "讀取錯誤": str(e)})
@@ -355,14 +415,10 @@ with tab_batch:
                 for i, cd in enumerate(cd_values, start=1):
                     X, wl = generate_single_spectrum(float(cd), b_cfg, seed=10_000 + i)
                     X_grid = resample_to_grid(X, wl, target_wl)
-                    pred = predict_cd(b_model, b_norm, X_grid)
                     samples.append({
                         "編號": i,
                         "filename": f"simulated_CD{cd:.1f}nm",
-                        "X_grid": X_grid,
-                        "Reference_CD_nm": float(cd),
-                        "Predicted_CD_nm": pred,
-                        "Error_nm": pred - float(cd),
+                        **_batch_prediction(X_grid, float(cd)),
                     })
 
                 st.session_state.batch_results = samples
@@ -373,7 +429,8 @@ with tab_batch:
     if st.session_state.get("batch_results"):
         ref_label = st.session_state.get("batch_ref_label", "參考")
         samples = st.session_state.batch_results
-        display_cols = ["編號", "filename", "Reference_CD_nm", "Predicted_CD_nm", "Error_nm"]
+        display_cols = ["編號", "filename", "Reference_CD_nm", "Predicted_CD_nm", "CD_2sigma_nm",
+                        "Network_CD_nm", "殘差警示", "Error_nm"]
         table_df = pd.DataFrame([{k: s.get(k) for k in display_cols + ["讀取錯誤"]} for s in samples])
         st.dataframe(table_df, width="stretch", hide_index=True)
 
@@ -464,7 +521,11 @@ with tab_batch:
             plt.close(fig)
 
             pc1, pc2, pc3 = st.columns(3)
-            pc1.metric("模型預測 CD (nm)", f"{picked['Predicted_CD_nm']:.2f}")
+            picked_2sigma = picked.get("CD_2sigma_nm")
+            pc1.metric("模型預測 CD (nm)", f"{picked['Predicted_CD_nm']:.2f}"
+                       + (f" ± {picked_2sigma:.2f}" if picked_2sigma is not None else ""))
+            if picked.get("殘差警示"):
+                st.warning("這條光譜與訓練資料不符（擬合殘差偏高），預測值可能不可靠。")
             if picked["Reference_CD_nm"] is not None:
                 pc2.metric(f"{ref_label} CD (nm)", f"{picked['Reference_CD_nm']:.2f}")
                 pc3.metric("誤差 (nm)", f"{picked['Error_nm']:+.2f}")
@@ -472,7 +533,7 @@ with tab_batch:
 # ----------------------------------------------------------------- train ---
 with tab_train:
     st.caption(
-        "調整超參數後按「開始訓練」，會用目前選的合成資料設定重新訓練 Multi-channel 1D CNN，"
+        "調整超參數後按「開始訓練」，會用目前選的合成資料設定重新訓練模型（預設 MLP，可改選 Multi-channel 1D CNN），"
         "完成後自動更新「光譜檢視與預測」頁籤使用的模型。訓練約需數十秒到數分鐘，畫面會卡住直到完成。"
     )
 
@@ -497,11 +558,25 @@ with tab_train:
             )
             patience = st.number_input("patience（early stopping，僅 plateau 模式）", 1, 500, default_cfg.patience, step=5)
 
+        m1, m2 = st.columns(2)
+        with m1:
+            model_kind = st.selectbox(
+                "模型", ["mlp", "cnn"], index=["mlp", "cnn"].index(default_cfg.model),
+                format_func={"mlp": "MLP（全連接，預設）", "cnn": "Multi-channel 1D CNN"}.get,
+                help="模擬資料上 MLP 的誤差約為理論下限的 1.15 倍，CNN 約 1.6 倍；真實光譜上需重新比較。",
+            )
+        with m2:
+            refine_on = st.checkbox(
+                "訓練擬合修正用的正向模型", value=default_cfg.refine == "on",
+                help="網路訓練完後，再用同一批資料訓練 CD → 光譜的反向網路並存進模型檔，"
+                     "預測時即可做擬合修正並得到誤差棒。訓練樣本少於約 700 筆時通常沒有幫助。",
+            )
+
         with st.expander("模型架構（進階）"):
             a1, a2 = st.columns(2)
             with a1:
                 pooling = st.selectbox(
-                    "pooling", ["flatten", "avg"], index=["flatten", "avg"].index(default_cfg.pooling),
+                    "pooling（僅 CNN）", ["flatten", "avg"], index=["flatten", "avg"].index(default_cfg.pooling),
                     help="flatten：保留波長位置資訊（建議，CD 主要反映在特徵峰的位置）。avg：舊版全域平均池化。",
                 )
             with a2:
@@ -524,6 +599,8 @@ with tab_train:
             patience=int(patience),
             pooling=str(pooling),
             dropout=float(dropout),
+            model=str(model_kind),
+            refine="on" if refine_on else "off",
         )
         progress_bar = st.progress(0.0, text="準備開始訓練...")
         train_start = time.time()
@@ -544,7 +621,11 @@ with tab_train:
                 ),
             )
 
-        result = run_training(cfg, progress_cb=_on_epoch)
+        def _on_decoder_epoch(epoch, max_epochs):
+            progress_bar.progress(min(epoch / max_epochs, 1.0),
+                                  text=f"網路訓練完成，正在訓練擬合修正用的正向模型 {epoch}/{max_epochs}")
+
+        result = run_training(cfg, progress_cb=_on_epoch, decoder_cb=_on_decoder_epoch)
 
         progress_bar.progress(1.0, text="訓練完成")
         st.success("訓練完成，模型已更新。")
@@ -555,10 +636,24 @@ with tab_train:
         mc2.metric("Test RMSE (nm)", f"{m['rmse']:.3f}")
         mc3.metric("Test R²", f"{m['r2']:.4f}")
         mc4.metric("Max abs err (nm)", f"{m['max_abs_err_nm']:.3f}")
+        if "refined" in m:
+            r = m["refined"]
+            st.caption("擬合修正後（同一組測試資料）")
+            rc1, rc2, rc3, rc4 = st.columns(4)
+            rc1.metric("Test MAE (nm)", f"{r['mae']:.3f}")
+            rc2.metric("Test RMSE (nm)", f"{r['rmse']:.3f}")
+            rc3.metric("Test R²", f"{r['r2']:.4f}")
+            rc4.metric("Max abs err (nm)", f"{r['max_abs_err_nm']:.3f}")
+            if not m["refinement_recommended"]:
+                st.warning(
+                    f"驗證資料上擬合修正（RMSE {m['val_rmse_refined']:.3f} nm）沒有比網路直接預測"
+                    f"（{m['val_rmse_network']:.3f} nm）好，預測頁籤預設不會啟用它。通常是訓練資料太少。"
+                )
 
         report_path = os.path.join(cfg.output_dir, "train_report.png")
         if os.path.exists(report_path):
             st.image(report_path)
 
         get_model.clear()
+        get_refinement.clear()
         st.info("已清除模型快取，切換回「光譜檢視與預測」頁籤即可使用新模型。")

@@ -1,4 +1,7 @@
-"""Stage 1: Mueller spectrum -> preprocessing -> Multi-channel 1D CNN -> CD regression.
+"""Mueller spectrum -> preprocessing -> regression network -> CD, plus the
+optional refinement step (refinement.py) trained on the same split.
+
+The network is Config.model: "mlp" (default) or "cnn" (Multi-channel 1D CNN).
 
 Uses synthetic data (data_generation.py) as a stand-in until real measured
 spectra are available. Run from the `src` directory or with `src` on
@@ -35,7 +38,8 @@ from config import Config
 from data_generation import generate_dataset
 from dataset import MuellerSpectrumDataset, Normalizer, split_indices
 from metrics import regression_metrics
-from models import MultiChannelCNN1D
+from models import build_model
+from refinement import Refinement, decoder_epochs, fit_decoder
 
 
 def set_seed(seed: int):
@@ -52,19 +56,45 @@ def parse_args(cfg: Config) -> Config:
 
 
 def model_arch(cfg: Config) -> dict:
-    """Constructor kwargs for MultiChannelCNN1D -- saved into the checkpoint
-    so inference rebuilds exactly the architecture that was trained."""
-    return dict(n_channels=cfg.n_channels, hidden=cfg.hidden_dim, dropout=cfg.dropout,
-                pooling=cfg.pooling, n_wavelength=cfg.n_wavelength)
+    """models.build_model kwargs -- saved into the checkpoint so inference
+    rebuilds exactly the architecture that was trained."""
+    arch = dict(model=cfg.model, n_channels=cfg.n_channels, hidden=cfg.hidden_dim,
+                dropout=cfg.dropout, n_wavelength=cfg.n_wavelength, n_outputs=1 + cfg.aux_targets)
+    if cfg.model == "cnn":
+        arch.update(pooling=cfg.pooling, downsample=cfg.downsample, norm=cfg.norm,
+                    conv_groups=cfg.conv_groups)
+    return arch
 
 
-def run_epoch(model, loader, criterion, optimizer, device, train: bool):
+class CDLoss(nn.Module):
+    """MSE on CD, plus aux_weight x MSE on the auxiliary outputs of a
+    multi-task model (output 0 is CD, the rest are nuisance parameters)."""
+
+    def __init__(self, aux_weight: float = 0.0):
+        super().__init__()
+        self.aux_weight = aux_weight
+        self.mse = nn.MSELoss()
+
+    def forward(self, pred, y):
+        if pred.ndim == 1:
+            return self.mse(pred, y)
+        loss = self.mse(pred[:, 0], y[:, 0])
+        if self.aux_weight > 0:
+            loss = loss + self.aux_weight * self.mse(pred[:, 1:], y[:, 1:])
+        return loss
+
+
+def run_epoch(model, loader, criterion, optimizer, device, train: bool, augment_std=None):
+    """augment_std: per-channel noise std in normalized units, shaped
+    (n_channels, 1), added fresh to every training batch; None disables."""
     model.train(mode=train)
     total_loss = 0.0
     n = 0
     with torch.set_grad_enabled(train):
         for X, y in loader:
             X, y = X.to(device), y.to(device)
+            if train and augment_std is not None:
+                X = X + torch.randn_like(X) * augment_std
             pred = model(X)
             loss = criterion(pred, y)
             if train:
@@ -78,13 +108,17 @@ def run_epoch(model, loader, criterion, optimizer, device, train: bool):
 
 @torch.no_grad()
 def predict(model, loader, device):
+    """Normalized CD predictions and targets (auxiliary outputs dropped)."""
     model.eval()
     preds, trues = [], []
     for X, y in loader:
         X = X.to(device)
         pred = model(X).cpu().numpy()
+        y = y.numpy()
+        if pred.ndim == 2:
+            pred, y = pred[:, 0], y[:, 0]
         preds.append(pred)
-        trues.append(y.numpy())
+        trues.append(y)
     return np.concatenate(preds), np.concatenate(trues)
 
 
@@ -101,15 +135,74 @@ def nm_error_stats(model, loader, norm: Normalizer, device) -> dict:
     }
 
 
-def run_training(cfg: Config, progress_cb=None) -> dict:
+def add_label_noise(y: np.ndarray, train_idx, val_idx, cfg: Config) -> None:
+    """Adds cfg.label_noise_std of Gaussian error to the train/val CD labels,
+    in place. Deterministic in cfg.seed, so anything that rebuilds the
+    training set (experiments/refine.py) gets the very same noisy labels."""
+    if cfg.label_noise_std > 0:
+        label_rng = np.random.default_rng([cfg.seed, 1])
+        noisy = np.concatenate([train_idx, val_idx])
+        y[noisy] += label_rng.normal(0, cfg.label_noise_std, size=len(noisy)).astype(np.float32)
+
+
+def error_metrics(true: np.ndarray, pred: np.ndarray, cfg: Config) -> dict:
+    metrics = regression_metrics(true, pred)
+    err = np.abs(pred - true)
+    metrics.update({
+        "p95_abs_err_nm": float(np.percentile(err, 95)),
+        "p99_abs_err_nm": float(np.percentile(err, 99)),
+        "max_abs_err_nm": float(err.max()),
+        "fraction_over_threshold": float((err > cfg.error_threshold_nm).mean()),
+    })
+    return metrics
+
+
+def train_refinement(model, cfg: Config, norm: Normalizer, data, X_norm, train_idx, val_idx,
+                     progress_cb=None) -> tuple:
+    """Trains the decoder on the training split, removes the fitted CD's
+    systematic error on the same split (Refinement.calibrate) and sets the
+    misfit limit / recommendation on the validation split. Returns (Refinement, {"val_rmse_network",
+    "val_rmse_refined"}).
+
+    Decoder inputs are CD plus any nuisance parameters the dataset labels
+    (data.nuisance); with none, CD alone.
+    """
+    params = norm.transform_y(data.y[train_idx])[:, None]
+    if data.nuisance is not None and data.nuisance.shape[1] > 0:
+        params = np.column_stack([params, data.nuisance[train_idx]])
+    epochs = decoder_epochs(cfg.decoder_epochs, len(train_idx))
+    decoder = fit_decoder(X_norm[train_idx].reshape(len(train_idx), -1).astype(np.float32),
+                          params.astype(np.float32), epochs, seed=cfg.seed, progress_cb=progress_cb)
+
+    norm_dict = {"mean": norm.mean, "std": norm.std, "y_mean": norm.y_mean, "y_std": norm.y_std}
+    step = (cfg.wavelength_max - cfg.wavelength_min) / (cfg.n_wavelength - 1)
+    refinement = Refinement(decoder, norm_dict, cfg.n_channels, cfg.n_wavelength, step)
+    refinement.calibrate(model, data.X[train_idx], data.y[train_idx])
+
+    val = refinement.refine(model, data.X[val_idx])
+    rmse = lambda pred: float(np.sqrt(np.mean((pred - data.y[val_idx]) ** 2)))
+    scores = {"val_rmse_network": rmse(val["cd_network"]), "val_rmse_refined": rmse(val["cd"])}
+    # Too few training spectra make the decoder too rough to help; let the
+    # validation split decide which prediction to prefer.
+    refinement.recommended = scores["val_rmse_refined"] < scores["val_rmse_network"]
+    # Spectra like the training data should essentially never be flagged.
+    refinement.misfit_limit = float(np.percentile(val["misfit"], 99.9))
+    return refinement, scores
+
+
+def run_training(cfg: Config, progress_cb=None, decoder_cb=None) -> dict:
     """Runs the full train/val/test pipeline for one Config and writes the
     checkpoint + history/metrics json to cfg.output_dir.
 
     progress_cb(epoch, max_epochs, epoch_log: dict), if given, is called
-    after every epoch -- e.g. so a UI can show live progress.
+    after every network epoch -- e.g. so a UI can show live progress;
+    decoder_cb(epoch, max_epochs) likewise for the refinement decoder.
 
-    Returns {"model", "cfg", "norm", "history", "metrics"}.
+    Returns {"model", "cfg", "norm", "history", "metrics", "refinement"}
+    ("refinement" is None with cfg.refine == "off").
     """
+    if cfg.refine not in ("on", "off"):
+        raise ValueError(f"refine must be 'on' or 'off', got {cfg.refine!r}")
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -126,13 +219,22 @@ def run_training(cfg: Config, progress_cb=None) -> dict:
         noise_std=cfg.noise_std,
         seed=cfg.seed,
         physics_seed=cfg.physics_seed,
+        n_nuisance=cfg.n_nuisance,
+        nuisance_strength=cfg.nuisance_strength,
     )
+    if cfg.aux_targets > cfg.n_nuisance:
+        raise ValueError(f"aux_targets ({cfg.aux_targets}) cannot exceed n_nuisance ({cfg.n_nuisance})")
 
     train_idx, val_idx, test_idx = split_indices(cfg.n_samples, cfg.val_ratio, cfg.test_ratio, cfg.seed)
+    add_label_noise(data.y, train_idx, val_idx, cfg)
 
     norm = Normalizer.fit(data.X[train_idx], data.y[train_idx])
     X_norm = norm.transform_X(data.X)
     y_norm = norm.transform_y(data.y)
+    if cfg.aux_targets > 0:
+        # Nuisances are uniform in [-1, 1]; x sqrt(3) gives them unit
+        # variance, the same scale as the normalized CD target.
+        y_norm = np.column_stack([y_norm, data.nuisance[:, :cfg.aux_targets] * np.sqrt(3.0)])
 
     train_ds = MuellerSpectrumDataset(X_norm[train_idx], y_norm[train_idx])
     val_ds = MuellerSpectrumDataset(X_norm[val_idx], y_norm[val_idx])
@@ -143,8 +245,9 @@ def run_training(cfg: Config, progress_cb=None) -> dict:
     test_loader = DataLoader(test_ds, batch_size=cfg.batch_size)
 
     arch = model_arch(cfg)
-    model = MultiChannelCNN1D(**arch).to(device)
-    criterion = nn.MSELoss()
+    model = build_model(arch).to(device)
+    criterion = CDLoss(cfg.aux_loss_weight)
+    val_criterion = CDLoss()  # CD only, so val loss is comparable across runs
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     if cfg.lr_schedule == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=cfg.lr * 0.01)
@@ -153,14 +256,19 @@ def run_training(cfg: Config, progress_cb=None) -> dict:
     else:
         raise ValueError(f"lr_schedule must be 'cosine' or 'plateau', got {cfg.lr_schedule!r}")
 
+    augment_std = None
+    if cfg.noise_augment_std > 0:
+        augment_std = torch.from_numpy(cfg.noise_augment_std / norm.std).float().to(device)
+
     best_val = float("inf")
     best_state = None
     epochs_no_improve = 0
     history = []
 
     for epoch in range(1, cfg.epochs + 1):
-        train_loss = run_epoch(model, train_loader, criterion, optimizer, device, train=True)
-        val_loss = run_epoch(model, val_loader, criterion, optimizer, device, train=False)
+        train_loss = run_epoch(model, train_loader, criterion, optimizer, device, train=True,
+                               augment_std=augment_std)
+        val_loss = run_epoch(model, val_loader, val_criterion, optimizer, device, train=False)
         val_stats = nm_error_stats(model, val_loader, norm, device)
         if cfg.lr_schedule == "plateau":
             scheduler.step(val_loss)
@@ -192,15 +300,20 @@ def run_training(cfg: Config, progress_cb=None) -> dict:
     pred_norm, true_norm = predict(model, test_loader, device)
     pred = norm.inverse_transform_y(pred_norm)
     true = norm.inverse_transform_y(true_norm)
-    metrics = regression_metrics(true, pred)
-    err = np.abs(pred - true)
-    metrics.update({
-        "p95_abs_err_nm": float(np.percentile(err, 95)),
-        "p99_abs_err_nm": float(np.percentile(err, 99)),
-        "max_abs_err_nm": float(err.max()),
-        "fraction_over_threshold": float((err > cfg.error_threshold_nm).mean()),
-    })
+    metrics = error_metrics(true, pred, cfg)
     print("Test metrics:", metrics)
+
+    refinement = None
+    if cfg.refine == "on":
+        model = model.cpu()
+        refinement, scores = train_refinement(model, cfg, norm, data, X_norm, train_idx, val_idx, decoder_cb)
+        test = refinement.refine(model, data.X[test_idx])
+        metrics.update(scores)
+        metrics["refinement_recommended"] = bool(refinement.recommended)
+        metrics["refined"] = error_metrics(true, test["cd"].astype(np.float32), cfg)
+        metrics["refined"]["fraction_flagged"] = float(test["flagged"].mean())
+        print("Refined test metrics:", metrics["refined"],
+              "(recommended)" if refinement.recommended else "(NOT recommended: worse than the network on validation)")
 
     torch.save(
         {
@@ -211,6 +324,7 @@ def run_training(cfg: Config, progress_cb=None) -> dict:
             "norm_std": norm.std,
             "norm_y_mean": norm.y_mean,
             "norm_y_std": norm.y_std,
+            **({"refinement": refinement.state()} if refinement is not None else {}),
         },
         os.path.join(cfg.output_dir, "multichannel_cnn.pt"),
     )
@@ -235,7 +349,10 @@ def run_training(cfg: Config, progress_cb=None) -> dict:
         axes[1].plot(lims, lims, "r--", linewidth=1)
         axes[1].set_xlabel("true CD (nm)")
         axes[1].set_ylabel("predicted CD (nm)")
-        axes[1].set_title(f"Test: MAE={metrics['mae']:.3f}  max_err={metrics['max_abs_err_nm']:.3f}")
+        title = f"Test (network): MAE={metrics['mae']:.3f}  max_err={metrics['max_abs_err_nm']:.3f}"
+        if refinement is not None:
+            title += f"\nrefined: MAE={metrics['refined']['mae']:.3f}  max_err={metrics['refined']['max_abs_err_nm']:.3f}"
+        axes[1].set_title(title, fontsize=10)
 
         fig.tight_layout()
         fig.savefig(os.path.join(cfg.output_dir, "train_report.png"), dpi=150)
@@ -243,7 +360,8 @@ def run_training(cfg: Config, progress_cb=None) -> dict:
     except ImportError:
         pass
 
-    return {"model": model, "cfg": cfg, "norm": norm, "history": history, "metrics": metrics}
+    return {"model": model, "cfg": cfg, "norm": norm, "history": history, "metrics": metrics,
+            "refinement": refinement}
 
 
 def main():
