@@ -19,7 +19,10 @@ Three tabs:
     either raw or as a deviation from the batch mean or from another chosen
     sample.
   * 模型訓練 / 超參數 -- adjust training hyperparameters and retrain, without
-    touching config.py or the command line.
+    touching config.py or the command line. Trains on synthetic spectra or
+    on real ones (a local folder of spectrum files plus a reference-CD
+    table, src/real_data.py), optionally with k-fold cross-validation first
+    (src/cross_validate.py).
 
 outputs/multichannel_cnn.pt is the checkpoint all tabs read/write (the
 file name predates the MLP option; it holds whichever model was trained).
@@ -47,6 +50,7 @@ from config import Config  # noqa: E402
 from spectrum_io import CHANNEL_LABELS, generate_single_spectrum, load_spectrum_file, resample_to_grid  # noqa: E402
 from inference import load_checkpoint, load_refinement, predict_cd, predict_cd_refined, sensitivity_map  # noqa: E402
 from train import run_training  # noqa: E402
+from cross_validate import cross_validate  # noqa: E402
 
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "outputs", "multichannel_cnn.pt")
 SENSITIVITY_PERCENTILE = 75  # per-channel: shade the top 25% most CD-sensitive wavelength points
@@ -178,6 +182,8 @@ with tab_viewer:
         mode = st.radio("選擇來源", ["生成模擬光譜（測試用）", "上傳光譜檔"])
 
         if mode == "生成模擬光譜（測試用）":
+            if model_cfg.data_source != "synthetic":
+                st.warning("目前的模型是用真實資料訓練的，模擬光譜與它無關，預測值沒有意義。請改用「上傳光譜檔」。")
             cd_value = st.slider("目標 CD (nm)", float(default_cfg.cd_min), float(default_cfg.cd_max), 50.0)
             if st.button("產生新的模擬光譜"):
                 X, wl = generate_single_spectrum(cd_value, model_cfg)
@@ -533,11 +539,44 @@ with tab_batch:
 # ----------------------------------------------------------------- train ---
 with tab_train:
     st.caption(
-        "調整超參數後按「開始訓練」，會用目前選的合成資料設定重新訓練模型（預設 MLP，可改選 Multi-channel 1D CNN），"
+        "調整設定後按「開始訓練」，會用合成資料或本機的真實資料重新訓練模型（預設 MLP），"
         "完成後自動更新「光譜檢視與預測」頁籤使用的模型。訓練約需數十秒到數分鐘，畫面會卡住直到完成。"
     )
 
     with st.form("train_form"):
+        data_source = st.radio(
+            "訓練資料", ["synthetic", "folder"], horizontal=True,
+            format_func={"synthetic": "合成資料（測試用）", "folder": "真實資料：光譜資料夾 + 參考 CD 對照表"}.get,
+        )
+        d1, d2 = st.columns(2)
+        with d1:
+            spectra_dir = st.text_input(
+                "光譜資料夾路徑（僅真實資料）", value=default_cfg.spectra_dir,
+                help="本機資料夾，每個樣本一個光譜檔（.csv / .dat / .npy / .zip）。檔案只在本機讀取，不會上傳。",
+            )
+        with d2:
+            labels_csv = st.text_input(
+                "參考 CD 對照表路徑（僅真實資料）", value=default_cfg.labels_csv,
+                help="CSV，欄位：filename、CD_nm；可選 wafer（同一片 wafer 的樣本切分時會放在一起）"
+                     "與其他結構參數欄位。格式說明見 src/real_data.py。",
+            )
+        g1, g2, g3, g4, g5 = st.columns(5)
+        with g1:
+            n_channels = st.number_input("通道數", 1, 64, default_cfg.n_channels)
+        with g2:
+            wavelength_min = st.number_input("波長下限 (nm)", 0.0, 100000.0, default_cfg.wavelength_min, step=10.0)
+        with g3:
+            wavelength_max = st.number_input("波長上限 (nm)", 0.0, 100000.0, default_cfg.wavelength_max, step=10.0)
+        with g4:
+            n_wavelength = st.number_input("波長點數", 8, 5000, default_cfg.n_wavelength)
+        with g5:
+            cv_folds = st.number_input(
+                "交叉驗證折數", 0, 20, 0,
+                help="0 = 不做。2 以上：先做 k 折交叉驗證估計表現（每個樣本都會被留出預測一次），"
+                     "再用全部資料訓練最後的模型。樣本只有數十到數百筆時建議使用 5。",
+            )
+        st.caption("真實資料：通道數與波長範圍必須符合實際光譜，且波長範圍要落在量測範圍之內。")
+
         c1, c2, c3 = st.columns(3)
         with c1:
             n_samples = st.number_input("n_samples（合成資料筆數）", 500, 100000, default_cfg.n_samples, step=500)
@@ -561,8 +600,9 @@ with tab_train:
         m1, m2 = st.columns(2)
         with m1:
             model_kind = st.selectbox(
-                "模型", ["mlp", "cnn"], index=["mlp", "cnn"].index(default_cfg.model),
-                format_func={"mlp": "MLP（全連接，預設）", "cnn": "Multi-channel 1D CNN"}.get,
+                "模型", ["mlp", "cnn", "cnn2d", "cnn3d"], index=["mlp", "cnn", "cnn2d", "cnn3d"].index(default_cfg.model),
+                format_func={"mlp": "MLP（全連接，預設）", "cnn": "Multi-channel 1D CNN",
+                             "cnn2d": "2D CNN（通道 × 波長）", "cnn3d": "3D CNN（4 × 4 × 波長）"}.get,
                 help="模擬資料上 MLP 的誤差約為理論下限的 1.15 倍，CNN 約 1.6 倍；真實光譜上需重新比較。",
             )
         with m2:
@@ -581,6 +621,18 @@ with tab_train:
                 )
             with a2:
                 dropout = st.number_input("dropout", 0.0, 0.9, default_cfg.dropout, step=0.05, format="%.2f")
+            a3, a4 = st.columns(2)
+            with a3:
+                attention = st.selectbox(
+                    "Channel Attention（僅 1D CNN）", ["none", "input"],
+                    index=["none", "input"].index(default_cfg.attention),
+                    format_func={"none": "不使用", "input": "輸入通道加權"}.get,
+                )
+            with a4:
+                derivative = st.selectbox(
+                    "微分特徵（僅 MLP / 1D CNN）", [0, 1, 2], index=default_cfg.derivative,
+                    format_func={0: "不使用", 1: "加入一階微分", 2: "加入一階與二階微分"}.get,
+                )
 
         submitted = st.form_submit_button("開始訓練")
 
@@ -601,7 +653,53 @@ with tab_train:
             dropout=float(dropout),
             model=str(model_kind),
             refine="on" if refine_on else "off",
+            attention=str(attention),
+            derivative=int(derivative),
+            data_source=str(data_source),
+            spectra_dir=spectra_dir.strip().strip('"'),
+            labels_csv=labels_csv.strip().strip('"'),
+            n_channels=int(n_channels),
+            wavelength_min=float(wavelength_min),
+            wavelength_max=float(wavelength_max),
+            n_wavelength=int(n_wavelength),
         )
+        if cfg.data_source == "folder" and not (os.path.isdir(cfg.spectra_dir) and os.path.isfile(cfg.labels_csv)):
+            st.error("找不到光譜資料夾或參考 CD 對照表，請確認兩個路徑。")
+            st.stop()
+
+        def _show_acceptance(m: dict):
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric(f"最大誤差 (nm)，門檻 {cfg.error_threshold_nm:g}", f"{m['max_abs_err_nm']:.3f}",
+                      "通過" if m["meets_threshold"] else "未通過",
+                      delta_color="normal" if m["meets_threshold"] else "inverse")
+            a2.metric(f"超過 {cfg.error_threshold_nm:g} nm 的比例", f"{m['fraction_over_threshold']:.1%}")
+            a3.metric("RMSE (nm)", f"{m['rmse']:.3f}")
+            a4.metric("MAE (nm)", f"{m['mae']:.3f}")
+
+        if cv_folds >= 2:
+            cv_bar = st.progress(0.0, text="交叉驗證準備中...")
+            try:
+                cv = cross_validate(
+                    cfg, int(cv_folds), log=lambda _line: None,
+                    progress_cb=lambda k, n: cv_bar.progress((k - 1) / n, text=f"交叉驗證：第 {k}/{n} 折訓練中"),
+                )
+            except Exception as e:
+                st.error(f"交叉驗證失敗：{e}")
+                st.stop()
+            cv_bar.progress(1.0, text="交叉驗證完成")
+            summary = cv["summary"]
+            st.subheader(f"{summary['folds']} 折交叉驗證（{summary['n_samples']} 個樣本，每個都被留出預測一次）")
+            if summary["n_groups"]:
+                st.caption(f"依對照表的 wafer / group 欄位分組：共 {summary['n_groups']} 組，同一組的樣本不會同時出現在訓練與測試。")
+            _show_acceptance(summary["reported"])
+            cv_dir = os.path.join(cfg.output_dir, "cross_validation")
+            st.image(os.path.join(cv_dir, "report.png"))
+            st.dataframe(cv["predictions"], width="stretch", hide_index=True)
+            st.caption(f"結果已存到 {cv_dir}（predictions.csv、summary.json、report.png）。")
+            # The cross-validation is the performance estimate; the model
+            # to deploy can then use every sample.
+            cfg = dataclasses.replace(cfg, test_ratio=0.0)
+
         progress_bar = st.progress(0.0, text="準備開始訓練...")
         train_start = time.time()
 
@@ -625,25 +723,26 @@ with tab_train:
             progress_bar.progress(min(epoch / max_epochs, 1.0),
                                   text=f"網路訓練完成，正在訓練擬合修正用的正向模型 {epoch}/{max_epochs}")
 
-        result = run_training(cfg, progress_cb=_on_epoch, decoder_cb=_on_decoder_epoch)
+        try:
+            result = run_training(cfg, progress_cb=_on_epoch, decoder_cb=_on_decoder_epoch)
+        except Exception as e:
+            st.error(f"訓練失敗：{e}")
+            st.stop()
 
         progress_bar.progress(1.0, text="訓練完成")
         st.success("訓練完成，模型已更新。")
 
         m = result["metrics"]
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("Test MAE (nm)", f"{m['mae']:.3f}")
-        mc2.metric("Test RMSE (nm)", f"{m['rmse']:.3f}")
-        mc3.metric("Test R²", f"{m['r2']:.4f}")
-        mc4.metric("Max abs err (nm)", f"{m['max_abs_err_nm']:.3f}")
+        st.caption(f"訓練 {m['n_train']} 筆、驗證 {m['n_val']} 筆、測試 {m['n_test']} 筆")
+        if m["n_test"] == 0:
+            st.info("最後的模型使用了全部樣本，沒有另外保留測試資料；表現請看上方的交叉驗證結果。")
+        else:
+            st.caption("測試資料：網路直接預測")
+            _show_acceptance(m)
         if "refined" in m:
-            r = m["refined"]
-            st.caption("擬合修正後（同一組測試資料）")
-            rc1, rc2, rc3, rc4 = st.columns(4)
-            rc1.metric("Test MAE (nm)", f"{r['mae']:.3f}")
-            rc2.metric("Test RMSE (nm)", f"{r['rmse']:.3f}")
-            rc3.metric("Test R²", f"{r['r2']:.4f}")
-            rc4.metric("Max abs err (nm)", f"{r['max_abs_err_nm']:.3f}")
+            st.caption("測試資料：擬合修正後")
+            _show_acceptance(m["refined"])
+        if "refinement_recommended" in m:
             if not m["refinement_recommended"]:
                 st.warning(
                     f"驗證資料上擬合修正（RMSE {m['val_rmse_refined']:.3f} nm）沒有比網路直接預測"

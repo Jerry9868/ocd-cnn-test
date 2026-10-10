@@ -85,6 +85,21 @@ SUITES = {
            for s in (0.3, 1.0) for n in (1000, 8000, 24000)},
         **{f"cnn_label_noise{s}_n8000": dict(label_noise_std=s) for s in (0.3, 1.0)},
     },
+    # The rest of the planned comparison, against "arch"'s base (Multi-channel
+    # 1D CNN), mlp and per_channel_conv (independent 1D CNNs + fusion):
+    # Channel Attention, 2D / 3D CNN, derivative features.
+    # Measured 2026-10-10 (base 0.105 nm, mlp 0.077): attention 0.108, cnn2d
+    # 0.111, cnn3d 0.119, deriv1 0.121, deriv2 0.149, mlp_deriv1 0.096 -- none
+    # helps. The attention gates all end at 0.98-1.01: every synthetic channel
+    # is an equally informative random mixture, so there is nothing to weight.
+    "stage": {
+        "attention": dict(attention="input"),
+        "cnn2d": dict(model="cnn2d"),
+        "cnn3d": dict(model="cnn3d"),
+        "deriv1": dict(derivative=1),
+        "deriv2": dict(derivative=2),
+        "mlp_deriv1": dict(model="mlp", derivative=1),
+    },
     # The plain MLP beat every CNN variant in "arch" -- how far does it go?
     "mlp": {
         "base": dict(model="mlp"),
@@ -157,7 +172,16 @@ def run_variant(suite, name, overrides, threads):
             "bound_known_rms": rms(known),
         }
     best = min(out["history"], key=lambda h: h["val_loss"])
+    extra = {}
+    if getattr(model, "attention", None) is not None:
+        # Mean input gate per channel over evaluation spectra.
+        X_norm = (eval_set.X[:2000] - norm["mean"][None]) / norm["std"][None]
+        with torch.no_grad():
+            gates = model.channel_attention(torch.from_numpy(X_norm).float())
+        extra["channel_attention_mean"] = gates.mean(dim=0).tolist()
+        extra["channel_attention_sd"] = gates.std(dim=0).tolist()
     return {
+        **extra,
         "overrides": overrides,
         "n_params": sum(p.numel() for p in model.parameters()),
         "n_train": n_train,

@@ -1,6 +1,8 @@
-numpy
-scikit-learn
-matplotlib
-torch
-streamlit
-pandas
+# Python 3.13. Exact versions the reported results were produced with.
+# No network access is needed at run time; see README.md for installing
+# from an internal package mirror or from a folder of downloaded wheels.
+numpy==2.5.3
+matplotlib==3.11.2
+torch==2.14.0
+streamlit==1.64.0
+pandas==3.0.6

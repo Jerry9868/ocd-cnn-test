@@ -22,6 +22,7 @@ def load_checkpoint(path: str):
         arch = dict(n_channels=cfg.n_channels, hidden=cfg.hidden_dim, dropout=0.2,
                     pooling="avg", n_wavelength=cfg.n_wavelength)
         cfg.pooling, cfg.dropout = "avg", 0.2
+    cfg.model = arch.get("model", "cnn")  # checkpoints from before Config.model existed are CNNs
     model = build_model(arch)
     model.load_state_dict(ckpt["model_state"])
     model.eval()

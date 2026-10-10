@@ -26,6 +26,12 @@ downsample / norm / conv_groups exist for the architecture ablation
     up to a multiple of n_channels. The head still sees every channel, so
     this isolates whether *convolutional* cross-channel features matter.
 
+attention: "none" (default) | "input" -- Channel Attention on the input: a
+small squeeze-and-excitation gate (InputChannelAttention) rescales each of
+the n_channels spectra before the first convolution, from a summary of the
+whole spectrum. The gate values say how much the network leans on each
+Mueller element for a given spectrum (channel_attention()).
+
 dropout defaults to 0 -- for this low-noise regression task, dropout right
 before the output mostly injects noise into the gradient (legacy training
 showed train MSE ~17x val MSE, i.e. dominated by dropout noise).
@@ -34,12 +40,33 @@ import torch
 import torch.nn as nn
 
 
+class InputChannelAttention(nn.Module):
+    """(batch, n_channels, L) -> (batch, n_channels) gates in (0, 2), 1 at
+    initialization, from each channel's mean and spread over wavelength."""
+
+    def __init__(self, n_channels: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2 * n_channels, 2 * n_channels), nn.ReLU(inplace=True),
+            nn.Linear(2 * n_channels, n_channels),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        summary = torch.cat([x.mean(dim=2), x.std(dim=2)], dim=1)
+        return 2 * torch.sigmoid(self.net(summary))
+
+
 class MultiChannelCNN1D(nn.Module):
     def __init__(self, n_channels: int = 16, hidden: int = 64, dropout: float = 0.0,
                  pooling: str = "flatten", n_wavelength: int = 101,
                  downsample: str = "maxpool", norm: str = "batch", conv_groups: str = "full",
-                 n_outputs: int = 1):
+                 n_outputs: int = 1, attention: str = "none"):
         super().__init__()
+        if attention not in ("none", "input"):
+            raise ValueError(f"attention must be 'none' or 'input', got {attention!r}")
+        self.attention = InputChannelAttention(n_channels) if attention == "input" else None
         if pooling not in ("flatten", "avg"):
             raise ValueError(f"pooling must be 'flatten' or 'avg', got {pooling!r}")
         if downsample not in ("maxpool", "avgpool", "none"):
@@ -83,7 +110,15 @@ class MultiChannelCNN1D(nn.Module):
             nn.Linear(hidden, n_outputs),
         )
 
+    def channel_attention(self, x: torch.Tensor) -> torch.Tensor:
+        """(batch, n_channels) input gates; all ones without attention."""
+        if self.attention is None:
+            return torch.ones(x.shape[:2])
+        return self.attention(x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.attention is not None:
+            x = x * self.attention(x)[:, :, None]
         x = self.features(x)
         x = self.head(x)
         return x.squeeze(-1) if self.n_outputs == 1 else x

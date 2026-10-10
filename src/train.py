@@ -1,18 +1,26 @@
 """Mueller spectrum -> preprocessing -> regression network -> CD, plus the
 optional refinement step (refinement.py) trained on the same split.
 
-The network is Config.model: "mlp" (default) or "cnn" (Multi-channel 1D CNN).
+The network is Config.model: "mlp" (default), "cnn" (Multi-channel 1D CNN),
+"cnn2d" or "cnn3d".
 
-Uses synthetic data (data_generation.py) as a stand-in until real measured
-spectra are available. Run from the `src` directory or with `src` on
+Data comes from Config.data_source: "synthetic" (data_generation.py, the
+stand-in used so far) or "folder" (real spectra plus a table of reference
+CD, see real_data.py). Run from the `src` directory or with `src` on
 PYTHONPATH:
 
     python train.py
     python train.py --epochs 50 --n_samples 4000
+    python train.py --data_source folder --spectra_dir D:/data/spectra --labels_csv D:/data/labels.csv
 
 `run_training(cfg)` is the reusable entry point -- app.py's "訓練/超參數"
 tab calls it directly with a Config built from the UI, so hyperparameters
-don't have to be edited in this file or passed on the CLI.
+don't have to be edited in this file or passed on the CLI. cross_validate.py
+reuses `fit` and `predict_cd` on its own splits.
+
+Acceptance is judged on the worst case first -- every sample within
+cfg.error_threshold_nm (0.3 nm) -- and on RMSE second; error_metrics
+reports both.
 
 Trains with plain MSE and selects the checkpoint with the lowest validation
 MSE -- this is stable and reproducible. Default setup (2026-09-30): flatten
@@ -47,12 +55,16 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
 
 
+def add_config_arguments(parser: argparse.ArgumentParser, cfg: Config) -> None:
+    """One --<field> option per Config field, defaulting to cfg's value."""
+    for field, default in cfg.__dict__.items():
+        parser.add_argument(f"--{field}", type=type(default), default=default)
+
+
 def parse_args(cfg: Config) -> Config:
     p = argparse.ArgumentParser()
-    for field, default in cfg.__dict__.items():
-        p.add_argument(f"--{field}", type=type(default), default=default)
-    args = p.parse_args()
-    return Config(**vars(args))
+    add_config_arguments(p, cfg)
+    return Config(**vars(p.parse_args()))
 
 
 def model_arch(cfg: Config) -> dict:
@@ -62,7 +74,9 @@ def model_arch(cfg: Config) -> dict:
                 dropout=cfg.dropout, n_wavelength=cfg.n_wavelength, n_outputs=1 + cfg.aux_targets)
     if cfg.model == "cnn":
         arch.update(pooling=cfg.pooling, downsample=cfg.downsample, norm=cfg.norm,
-                    conv_groups=cfg.conv_groups)
+                    conv_groups=cfg.conv_groups, attention=cfg.attention)
+    if cfg.derivative:
+        arch["derivative"] = cfg.derivative
     return arch
 
 
@@ -146,15 +160,53 @@ def add_label_noise(y: np.ndarray, train_idx, val_idx, cfg: Config) -> None:
 
 
 def error_metrics(true: np.ndarray, pred: np.ndarray, cfg: Config) -> dict:
-    metrics = regression_metrics(true, pred)
+    """The acceptance figures -- worst case against cfg.error_threshold_nm
+    first, RMSE second -- plus the usual regression metrics."""
     err = np.abs(pred - true)
+    metrics = {
+        "max_abs_err_nm": float(err.max()),
+        "fraction_over_threshold": float((err > cfg.error_threshold_nm).mean()),
+        "meets_threshold": bool(err.max() <= cfg.error_threshold_nm),
+    }
+    metrics.update(regression_metrics(true, pred))
     metrics.update({
         "p95_abs_err_nm": float(np.percentile(err, 95)),
         "p99_abs_err_nm": float(np.percentile(err, 99)),
-        "max_abs_err_nm": float(err.max()),
-        "fraction_over_threshold": float((err > cfg.error_threshold_nm).mean()),
     })
     return metrics
+
+
+def acceptance_line(metrics: dict, cfg: Config) -> str:
+    return (f"{'PASS' if metrics['meets_threshold'] else 'FAIL'} (every sample within {cfg.error_threshold_nm:g} nm): "
+            f"max |error| {metrics['max_abs_err_nm']:.3f} nm, {metrics['fraction_over_threshold']:.2%} over; "
+            f"RMSE {metrics['rmse']:.3f} nm")
+
+
+def load_dataset(cfg: Config):
+    """The labelled spectra cfg points at: .X, .y, .wavelength, .nuisance
+    and, for real data, .groups / .names."""
+    if cfg.data_source == "synthetic":
+        return generate_dataset(
+            n_samples=cfg.n_samples,
+            n_channels=cfg.n_channels,
+            n_wavelength=cfg.n_wavelength,
+            wavelength_min=cfg.wavelength_min,
+            wavelength_max=cfg.wavelength_max,
+            cd_min=cfg.cd_min,
+            cd_max=cfg.cd_max,
+            n_shared_bases=cfg.n_shared_bases,
+            noise_std=cfg.noise_std,
+            seed=cfg.seed,
+            physics_seed=cfg.physics_seed,
+            n_nuisance=cfg.n_nuisance,
+            nuisance_strength=cfg.nuisance_strength,
+        )
+    if cfg.data_source == "folder":
+        from real_data import load_labelled_folder
+        if not cfg.spectra_dir or not cfg.labels_csv:
+            raise ValueError("data_source='folder' needs spectra_dir and labels_csv")
+        return load_labelled_folder(cfg.spectra_dir, cfg.labels_csv, cfg)
+    raise ValueError(f"data_source must be 'synthetic' or 'folder', got {cfg.data_source!r}")
 
 
 def train_refinement(model, cfg: Config, norm: Normalizer, data, X_norm, train_idx, val_idx,
@@ -190,59 +242,33 @@ def train_refinement(model, cfg: Config, norm: Normalizer, data, X_norm, train_i
     return refinement, scores
 
 
-def run_training(cfg: Config, progress_cb=None, decoder_cb=None) -> dict:
-    """Runs the full train/val/test pipeline for one Config and writes the
-    checkpoint + history/metrics json to cfg.output_dir.
+def fit(cfg: Config, data, train_idx, val_idx, progress_cb=None, decoder_cb=None, log=print) -> dict:
+    """Trains the network (and, with cfg.refine == "on", the refinement) on
+    data[train_idx], selecting the epoch by loss on data[val_idx].
 
-    progress_cb(epoch, max_epochs, epoch_log: dict), if given, is called
-    after every network epoch -- e.g. so a UI can show live progress;
-    decoder_cb(epoch, max_epochs) likewise for the refinement decoder.
-
-    Returns {"model", "cfg", "norm", "history", "metrics", "refinement"}
-    ("refinement" is None with cfg.refine == "off").
+    Returns {"model" (on the CPU, in eval mode), "norm", "arch", "history",
+    "refinement" (None when off), "refinement_scores"}.
     """
     if cfg.refine not in ("on", "off"):
         raise ValueError(f"refine must be 'on' or 'off', got {cfg.refine!r}")
-    set_seed(cfg.seed)
+    if len(train_idx) == 0 or len(val_idx) == 0:
+        raise ValueError(f"need at least one training and one validation sample, got {len(train_idx)} / {len(val_idx)}")
+    n_labelled = data.nuisance.shape[1] if data.nuisance is not None else 0
+    if cfg.aux_targets > n_labelled:
+        raise ValueError(f"aux_targets ({cfg.aux_targets}) cannot exceed the {n_labelled} labelled nuisance parameters")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(cfg.output_dir, exist_ok=True)
-
-    data = generate_dataset(
-        n_samples=cfg.n_samples,
-        n_channels=cfg.n_channels,
-        n_wavelength=cfg.n_wavelength,
-        wavelength_min=cfg.wavelength_min,
-        wavelength_max=cfg.wavelength_max,
-        cd_min=cfg.cd_min,
-        cd_max=cfg.cd_max,
-        n_shared_bases=cfg.n_shared_bases,
-        noise_std=cfg.noise_std,
-        seed=cfg.seed,
-        physics_seed=cfg.physics_seed,
-        n_nuisance=cfg.n_nuisance,
-        nuisance_strength=cfg.nuisance_strength,
-    )
-    if cfg.aux_targets > cfg.n_nuisance:
-        raise ValueError(f"aux_targets ({cfg.aux_targets}) cannot exceed n_nuisance ({cfg.n_nuisance})")
-
-    train_idx, val_idx, test_idx = split_indices(cfg.n_samples, cfg.val_ratio, cfg.test_ratio, cfg.seed)
-    add_label_noise(data.y, train_idx, val_idx, cfg)
 
     norm = Normalizer.fit(data.X[train_idx], data.y[train_idx])
     X_norm = norm.transform_X(data.X)
     y_norm = norm.transform_y(data.y)
     if cfg.aux_targets > 0:
-        # Nuisances are uniform in [-1, 1]; x sqrt(3) gives them unit
-        # variance, the same scale as the normalized CD target.
+        # Nuisances have standard deviation 1/sqrt(3) (uniform in [-1, 1]);
+        # x sqrt(3) gives them unit variance, the scale of the normalized CD.
         y_norm = np.column_stack([y_norm, data.nuisance[:, :cfg.aux_targets] * np.sqrt(3.0)])
 
-    train_ds = MuellerSpectrumDataset(X_norm[train_idx], y_norm[train_idx])
-    val_ds = MuellerSpectrumDataset(X_norm[val_idx], y_norm[val_idx])
-    test_ds = MuellerSpectrumDataset(X_norm[test_idx], y_norm[test_idx])
-
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size)
-    test_loader = DataLoader(test_ds, batch_size=cfg.batch_size)
+    train_loader = DataLoader(MuellerSpectrumDataset(X_norm[train_idx], y_norm[train_idx]),
+                              batch_size=cfg.batch_size, shuffle=True)
+    val_loader = DataLoader(MuellerSpectrumDataset(X_norm[val_idx], y_norm[val_idx]), batch_size=cfg.batch_size)
 
     arch = model_arch(cfg)
     model = build_model(arch).to(device)
@@ -277,7 +303,7 @@ def run_training(cfg: Config, progress_cb=None, decoder_cb=None) -> dict:
         epoch_log = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss,
                      **{f"val_{k}_nm": v for k, v in val_stats.items()}}
         history.append(epoch_log)
-        print(
+        log(
             f"epoch {epoch:3d}  train_loss {train_loss:.4f}  val_loss {val_loss:.4f}  "
             f"val_mean {val_stats['mean']:.3f}nm  val_p99 {val_stats['p99']:.3f}nm  val_max {val_stats['max']:.3f}nm  "
             f"lr {optimizer.param_groups[0]['lr']:.2e}"
@@ -292,42 +318,104 @@ def run_training(cfg: Config, progress_cb=None, decoder_cb=None) -> dict:
         else:
             epochs_no_improve += 1
             if cfg.lr_schedule == "plateau" and epochs_no_improve >= cfg.patience:
-                print(f"Early stopping at epoch {epoch} (no val_loss improvement for {cfg.patience} epochs).")
+                log(f"Early stopping at epoch {epoch} (no val_loss improvement for {cfg.patience} epochs).")
                 break
 
     model.load_state_dict(best_state)
+    model = model.cpu().eval()
 
-    pred_norm, true_norm = predict(model, test_loader, device)
-    pred = norm.inverse_transform_y(pred_norm)
-    true = norm.inverse_transform_y(true_norm)
-    metrics = error_metrics(true, pred, cfg)
-    print("Test metrics:", metrics)
-
-    refinement = None
+    refinement, scores = None, {}
     if cfg.refine == "on":
-        model = model.cpu()
         refinement, scores = train_refinement(model, cfg, norm, data, X_norm, train_idx, val_idx, decoder_cb)
-        test = refinement.refine(model, data.X[test_idx])
-        metrics.update(scores)
-        metrics["refinement_recommended"] = bool(refinement.recommended)
-        metrics["refined"] = error_metrics(true, test["cd"].astype(np.float32), cfg)
-        metrics["refined"]["fraction_flagged"] = float(test["flagged"].mean())
-        print("Refined test metrics:", metrics["refined"],
-              "(recommended)" if refinement.recommended else "(NOT recommended: worse than the network on validation)")
+    return {"model": model, "norm": norm, "arch": arch, "history": history,
+            "refinement": refinement, "refinement_scores": scores}
 
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "config": cfg.__dict__,
-            "arch": arch,
-            "norm_mean": norm.mean,
-            "norm_std": norm.std,
-            "norm_y_mean": norm.y_mean,
-            "norm_y_std": norm.y_std,
-            **({"refinement": refinement.state()} if refinement is not None else {}),
-        },
-        os.path.join(cfg.output_dir, "multichannel_cnn.pt"),
-    )
+
+def predict_cd(fitted: dict, X: np.ndarray) -> dict:
+    """CD for raw spectra X (N, n_channels, L) from fit()'s result.
+
+    Returns (N,) arrays: "cd_network"; with a refinement also "cd_refined",
+    "cd_sd" (its 1-sigma error bar) and "flagged"; and "cd", the one to
+    report -- the refined value when the refinement was recommended on the
+    validation split, else the network's.
+    """
+    model, norm, refinement = fitted["model"], fitted["norm"], fitted["refinement"]
+    if refinement is None:
+        with torch.no_grad():
+            out = model(torch.from_numpy(norm.transform_X(X)).float()).numpy()
+        cd = norm.inverse_transform_y(out.reshape(len(X), -1)[:, 0].astype(np.float64))
+        return {"cd_network": cd, "cd": cd}
+    r = refinement.refine(model, X)
+    return {"cd_network": r["cd_network"], "cd_refined": r["cd"], "cd_sd": r["cd_sd"], "flagged": r["flagged"],
+            "cd": r["cd"] if refinement.recommended else r["cd_network"]}
+
+
+def checkpoint_dict(cfg: Config, fitted: dict) -> dict:
+    norm, refinement = fitted["norm"], fitted["refinement"]
+    return {
+        "model_state": fitted["model"].state_dict(),
+        "config": cfg.__dict__,
+        "arch": fitted["arch"],
+        "norm_mean": norm.mean,
+        "norm_std": norm.std,
+        "norm_y_mean": norm.y_mean,
+        "norm_y_std": norm.y_std,
+        **({"refinement": refinement.state()} if refinement is not None else {}),
+    }
+
+
+def run_training(cfg: Config, progress_cb=None, decoder_cb=None) -> dict:
+    """Runs the full train/val/test pipeline for one Config and writes the
+    checkpoint + history/metrics json to cfg.output_dir.
+
+    progress_cb(epoch, max_epochs, epoch_log: dict), if given, is called
+    after every network epoch -- e.g. so a UI can show live progress;
+    decoder_cb(epoch, max_epochs) likewise for the refinement decoder.
+
+    With cfg.test_ratio == 0 every sample goes to training / validation and
+    no test metrics are reported -- for the model to deploy once
+    cross_validate.py has estimated the performance.
+
+    Returns {"model", "cfg", "norm", "history", "metrics", "refinement"}
+    ("refinement" is None with cfg.refine == "off").
+    """
+    set_seed(cfg.seed)
+    os.makedirs(cfg.output_dir, exist_ok=True)
+
+    data = load_dataset(cfg)
+    train_idx, val_idx, test_idx = split_indices(len(data.y), cfg.val_ratio, cfg.test_ratio, cfg.seed,
+                                                 groups=getattr(data, "groups", None))
+    add_label_noise(data.y, train_idx, val_idx, cfg)
+
+    fitted = fit(cfg, data, train_idx, val_idx, progress_cb, decoder_cb)
+    model, norm, refinement, history = fitted["model"], fitted["norm"], fitted["refinement"], fitted["history"]
+
+    has_test = len(test_idx) > 0
+    metrics = {}
+    if has_test:
+        test = predict_cd(fitted, data.X[test_idx])
+        true = data.y[test_idx]
+        pred = test["cd_network"].astype(np.float32)
+        metrics = error_metrics(true, pred, cfg)
+        print("Test metrics:", metrics)
+        print("Network:", acceptance_line(metrics, cfg))
+    else:
+        print("No test split: every sample was used for training / validation. "
+              "cross_validate.py estimates the performance.")
+    metrics["n_train"], metrics["n_val"], metrics["n_test"] = len(train_idx), len(val_idx), len(test_idx)
+
+    if refinement is not None:
+        metrics.update(fitted["refinement_scores"])
+        metrics["refinement_recommended"] = bool(refinement.recommended)
+        if not refinement.recommended:
+            print("Refinement NOT recommended: worse than the network on validation")
+    if refinement is not None and has_test:
+        metrics["refined"] = error_metrics(true, test["cd_refined"].astype(np.float32), cfg)
+        metrics["refined"]["fraction_flagged"] = float(test["flagged"].mean())
+        print("Refined test metrics:", metrics["refined"])
+        print("Refined:", acceptance_line(metrics["refined"], cfg))
+
+    torch.save(checkpoint_dict(cfg, fitted), os.path.join(cfg.output_dir, "multichannel_cnn.pt"))
     with open(os.path.join(cfg.output_dir, "history.json"), "w") as f:
         json.dump(history, f, indent=2)
     with open(os.path.join(cfg.output_dir, "test_metrics.json"), "w") as f:
@@ -336,7 +424,8 @@ def run_training(cfg: Config, progress_cb=None, decoder_cb=None) -> dict:
     try:
         import matplotlib.pyplot as plt
 
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        fig, axes = plt.subplots(1, 2 if has_test else 1, figsize=(10 if has_test else 5, 4), squeeze=False)
+        axes = axes[0]
         axes[0].plot([h["epoch"] for h in history], [h["train_loss"] for h in history], label="train")
         axes[0].plot([h["epoch"] for h in history], [h["val_loss"] for h in history], label="val")
         axes[0].set_xlabel("epoch")
@@ -344,15 +433,17 @@ def run_training(cfg: Config, progress_cb=None, decoder_cb=None) -> dict:
         axes[0].legend()
         axes[0].set_title("Training curve")
 
-        axes[1].scatter(true, pred, s=8, alpha=0.5)
-        lims = [min(true.min(), pred.min()), max(true.max(), pred.max())]
-        axes[1].plot(lims, lims, "r--", linewidth=1)
-        axes[1].set_xlabel("true CD (nm)")
-        axes[1].set_ylabel("predicted CD (nm)")
-        title = f"Test (network): MAE={metrics['mae']:.3f}  max_err={metrics['max_abs_err_nm']:.3f}"
-        if refinement is not None:
-            title += f"\nrefined: MAE={metrics['refined']['mae']:.3f}  max_err={metrics['refined']['max_abs_err_nm']:.3f}"
-        axes[1].set_title(title, fontsize=10)
+        if has_test:
+            axes[1].scatter(true, pred, s=8, alpha=0.5)
+            lims = [min(true.min(), pred.min()), max(true.max(), pred.max())]
+            axes[1].plot(lims, lims, "r--", linewidth=1)
+            axes[1].set_xlabel("true CD (nm)")
+            axes[1].set_ylabel("predicted CD (nm)")
+            title = f"Test (network): MAE={metrics['mae']:.3f}  max_err={metrics['max_abs_err_nm']:.3f}"
+            if refinement is not None:
+                title += (f"\nrefined: MAE={metrics['refined']['mae']:.3f}  "
+                          f"max_err={metrics['refined']['max_abs_err_nm']:.3f}")
+            axes[1].set_title(title, fontsize=10)
 
         fig.tight_layout()
         fig.savefig(os.path.join(cfg.output_dir, "train_report.png"), dpi=150)

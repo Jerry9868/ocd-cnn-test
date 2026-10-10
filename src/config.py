@@ -15,6 +15,15 @@ class Config:
     wavelength_min: float = 200.0  # nm
     wavelength_max: float = 1000.0  # nm
 
+    # Where the labelled spectra come from. "synthetic": data_generation.py
+    # (everything under "Synthetic data generation" below). "folder": real
+    # measurements -- one spectrum file per sample in spectra_dir plus a
+    # table of reference CD values, labels_csv (see real_data.py); n_channels
+    # and the wavelength grid above must then describe the real spectra.
+    data_source: str = "synthetic"   # "synthetic" | "folder"
+    spectra_dir: str = ""
+    labels_csv: str = ""
+
     # Ground-truth CD range (nm), synthetic stand-in until real data is available
     cd_min: float = 20.0
     cd_max: float = 80.0
@@ -58,10 +67,17 @@ class Config:
     # the Multi-channel 1D CNN (models/multichannel_cnn.py); the three
     # switches below and `pooling` only apply to it. Re-compare on real
     # spectra before trusting the ranking (experiments/ablation.py arch).
-    model: str = "mlp"            # "mlp" | "cnn"
+    # "cnn2d" / "cnn3d" (models/cnn_nd.py) treat neighbouring Mueller
+    # elements like neighbouring pixels -- the assumption under test.
+    model: str = "mlp"            # "mlp" | "cnn" | "cnn2d" | "cnn3d"
     downsample: str = "maxpool"   # "maxpool" | "avgpool" | "none"
     norm: str = "batch"           # "batch" | "none"
     conv_groups: str = "full"     # "full" | "per_channel"
+    attention: str = "none"       # "none" | "input" (Channel Attention, "cnn" only)
+    # Wavelength derivatives appended to the input as extra channels
+    # (models/derivative.py): 0 = none, 1 = first, 2 = first and second.
+    # "mlp" and "cnn" only.
+    derivative: int = 0
 
     # Training
     batch_size: int = 64
@@ -93,10 +109,10 @@ class Config:
     aux_targets: int = 0
     aux_loss_weight: float = 1.0
 
-    # Reporting only -- what counts as an "acceptable" error, for the
-    # fraction_over_threshold test metric. Not currently met on every sample
-    # (see train.py's module docstring for what was tried and why it was
-    # reverted in favor of stability).
+    # Acceptance criterion (decided 2026-10-10): every sample's error within
+    # this many nm comes first, RMSE second. Reporting only -- training does
+    # not optimize against it (see train.py's module docstring for what was
+    # tried and why it was reverted in favor of stability).
     error_threshold_nm: float = 0.30
 
     # Output
